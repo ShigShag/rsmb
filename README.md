@@ -31,7 +31,7 @@ Three uses, each checked:
 ## Install
 
 ```
-cargo install --git https://github.com/ShigShag/rust-smb-client rsmb
+cargo install --git https://github.com/ShigShag/rsmb rsmb
 ```
 
 The repository holds two packages (`rsmb` and the test tool `smbtap`), so the package is named; the
