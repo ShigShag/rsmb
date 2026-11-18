@@ -223,4 +223,44 @@ The tests that look for a phrase in the manual compare with whitespace squashed
 
 - The relay still serves the crate's own exchange: the crate binds one socket per KDC call and
   makes one call for a TGT-only login (`tgs_exchange`; `authenticator.rs`), retrying on the same
-  socket, so "the first sender" is the crate's socket.
+  socket, so "the first sender" is the crate's socket. (Superseded after the stage by the fix
+  below: the crate's KDC client is no longer called at all.)
+
+## After Stage 5: the service ticket against a Windows KDC (2026-11-18)
+
+Reported by the user: `rsmb -H 172.16.5.5 -k --proxy socks5://127.0.0.1:1080` against a Windows
+Server AD DC failed with `Kerberos: asking the KDC inlanefreight.local:88 for a ticket for
+cifs/172.16.5.5: KDC error 41`, with the same cache `kinit` had written and the same result with
+and without the proxy. smbclient-ng worked against the same server.
+
+### Finding
+
+| # | Severity | Finding | How validated | What was done | Guarding test |
+|---|---|---|---|---|---|
+| 1 | high | The crate's TGS-REQ authenticator checksum for an RC4 session key is not RFC 4757 7.1's HMAC-MD5 (type -138), so a Windows KDC answers `KRB_AP_ERR_MODIFIED` (41); Samba's KDC does not verify it, so no test of Stage 5 could see it | Reproduced through the proxy. The crate's request, captured at the relay, got 41 when sent as it was; the same request with MIT `kvno`'s checksum profile (decrypted from `kvno`'s own request with the session key from the cache: type -138, value over the KDC-REQ-BODY as sent) got a TGS-REP, and one with no checksum got a TGS-REP too; the crate's formula differs | rsmb builds the TGS-REQ itself (the crate's encoders and parsers, its RC4 crypto, RFC 3961's checksum for AES and RFC 4757's for RC4) and hands the crate a `CCache` with the service ticket; the loopback relay is gone (plan V12) | `tgs_checksums_are_the_profiles_of_their_etypes` (impacket's known answer; fails with the crate's algorithm), `tgs_exchange_needs_a_tgt`, `kdc_talk_carries_the_exchange`, `kerberos_encryption_round_trips`, `kerberos_times_are_the_wire_format`; F72, X71, X72, S71 and `no_way_around_the_proxy` now run through rsmb's exchange against the Samba DC, direct and through the proxy |
+| 2 | high | A nonce whose DER INTEGER needs a leading zero byte (>= 2^31) makes a Windows KDC close the connection with a zero-length frame, reported as `the KDC's answer: Invalid data: DER: truncated TLV` | Measured with the same DC: an otherwise identical request with nonce `0x7fffffff` was answered, with `0x80000000` and `0xf06868a1` not | The nonce is masked to 31 bits | the exchange in F72 and X72 (which would fail for every login otherwise) |
+| 3 | medium | `cifs/172.16.5.5` is not an SPN of the realm: AD registers no SPN for an IP address, so `-H <an address>` cannot work with Kerberos whatever the client | MIT `kvno` for `cifs/172.16.5.5` through a loopback relay: "Server not found in Kerberos database" (KRB-ERROR 7); `cifs/ACADEMY-EA-DC01(.INLANEFREIGHT.LOCAL)` gives a TGS-REP (the DC's name from the domain's DNS SRV record) | Not a change: rsmb now reports it as KRB-ERROR 7, `the realm <realm> has no service cifs/<host>: give -H the name the server has in the realm`. With `-H academy-ea-dc01.inlanefreight.local` the login through the proxy works and `shares` lists eight shares | the message is in `docs/commands.md` and in the doc test; nothing in the gate uses an address as the SPN |
+
+### Rejected
+
+- **Vendoring `smb2` to patch the checksum in `crypto.rs`.** Nine lines would fix it, but the
+  repository would carry 92,600 lines of foreign code and the pin policy (`docs/plans/master-plan.md`
+  4.2) would have to be rewritten. `[patch.crates-io]` has no smaller form.
+- **The other agent's diagnosis** (the fixed forwardable/renewable options don't match the TGT's
+  flags): the cache's TGT has flags FPRIA, forwardable and renewable with a renew-till, and the
+  options are byte for byte impacket's. Sending no checksum would also have "fixed" the symptom,
+  but it is what Samba's KDC refuses smbclient-ng for (`KRB_AP_ERR_INAPP_CKSUM`), so rsmb sends
+  the correct one.
+- **A flag to name the SPN separately** (so `-H` could stay an address): the user asked not to add
+  one.
+
+### Checked and found correct
+
+- The rest of the Kerberos path was already right: with a service ticket for the DC's SPN in the
+  cache, the login through the proxy and a listing worked before any change, which isolated the
+  fault to the TGS exchange.
+- The KDC options, the `till`, the etype list and the AP-REQ that the crate builds are all
+  accepted by the same Windows DC (each variant measured through the proxy).
+- The gate's Kerberos tests pass with the service ticket rsmb now obtains: F71, F72 (with `-f` and
+  with the `-F` refusal), X71, X72, S71 and `no_way_around_the_proxy`, direct and through the
+  proxy.

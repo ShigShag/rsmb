@@ -1,6 +1,6 @@
 //! The connection to one server and everything that goes over it: dialer (direct or SOCKS5), the
-//! transport halves, login (NTLM, or Kerberos from the ticket cache with the KDC relay), the tree
-//! map, the `cd` check, the listing, the share list, the cache,
+//! transport halves, login (NTLM, or Kerberos from the ticket cache with rsmb's own TGS exchange),
+//! the tree map, the `cd` check, the listing, the share list, the cache,
 //! reconnect, and the mapping of the crate's errors to ours. All use of `smb2` is in this file.
 //! docs/architecture.md describes the design.
 
@@ -14,8 +14,15 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use smb2::KerberosCredentials;
-use smb2::auth::kerberos::ccache::{CCache, parse_ccache};
-use smb2::auth::kerberos::messages::parse_krb_error;
+use smb2::auth::kerberos::ccache::{CCache, CcacheCredential, CcachePrincipal, parse_ccache};
+use smb2::auth::kerberos::crypto::{
+    EncryptionType, compute_checksum, decrypt_aes_cts, decrypt_rc4_hmac, derive_key_aes,
+    encrypt_aes_cts, encrypt_rc4_hmac, usage_enc, usage_int,
+};
+use smb2::auth::kerberos::messages::{
+    EncryptedData, PrincipalName, encode_ap_req, encode_authenticator, encode_tgs_req,
+    encode_tgs_req_body, parse_enc_kdc_rep_part, parse_kdc_rep, parse_krb_error, parse_ticket,
+};
 use smb2::client::Connection;
 use smb2::msg::close::CloseRequest;
 use smb2::msg::create::{
@@ -35,8 +42,8 @@ use smb2::types::status::NtStatus;
 use smb2::types::{Command, CreditCharge, FileId, OplockLevel, TreeId};
 use smb2::{CompoundOp, FileWriter, Frame, RenameOptions, Tree};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 
@@ -600,8 +607,8 @@ fn display_user(t: &Target) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Kerberos: the ticket cache, the KDC's address, the relay, the errors (docs/commands.md,
-// "Kerberos"). Every message of a Kerberos failure starts `Kerberos: `.
+// Kerberos: the ticket cache, the KDC's address, rsmb's own TGS exchange, the errors
+// (docs/commands.md, "Kerberos"). Every message of a Kerberos failure starts `Kerberos: `.
 
 fn kerberos_error(kind: Kind, message: impl std::fmt::Display) -> Error {
     Error::new(kind, format!("Kerberos: {message}"))
@@ -916,7 +923,7 @@ fn kdc_error(code: i32, text: Option<&str>, host: &str, user: &str, realm: &str)
     }
 }
 
-/// Where the relay sends the crate's requests, and what its messages need.
+/// Where rsmb asks for the service ticket, and what its messages need.
 struct Kdc {
     /// The login's target with the KDC's host and port: `open_tcp` dials it as it dials the
     /// server, so through the proxy when there is one, and never around it.
@@ -932,6 +939,19 @@ struct Kdc {
 }
 
 impl Kdc {
+    /// The login's error for something that went wrong with this KDC: what was asked for, and
+    /// why it failed.
+    fn failed(&self, kind: Kind, reason: String) -> Error {
+        kerberos_error(
+            kind,
+            format!(
+                "asking the KDC {} for a ticket for cifs/{}: {reason}",
+                hostport(&self.target.host, self.target.port),
+                self.host
+            ),
+        )
+    }
+
     /// What follows a message about a KDC that could not be asked: where its address came from
     /// and what to do; never a file only root can write.
     fn tail(&self) -> String {
@@ -959,7 +979,7 @@ impl Kdc {
 }
 
 /// Writes one KDC request with its 4-byte length in one write, reads the answer. An answer that
-/// cannot go back as a datagram is `InvalidData`.
+/// claims more than 1 MB is `InvalidData` (the crate's own KDC client has the same bound).
 async fn kdc_exchange(tcp: &mut TcpStream, request: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut m = Vec::with_capacity(request.len() + 4);
     m.extend_from_slice(&(request.len() as u32).to_be_bytes());
@@ -968,10 +988,10 @@ async fn kdc_exchange(tcp: &mut TcpStream, request: &[u8]) -> std::io::Result<Ve
     let mut h = [0u8; 4];
     tcp.read_exact(&mut h).await?;
     let len = u32::from_be_bytes(h) as usize;
-    if len > 65_507 {
+    if len > 1 << 20 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("the KDC's answer of {len} bytes does not fit a datagram"),
+            format!("the KDC's answer of {len} bytes is too large"),
         ));
     }
     let mut answer = vec![0u8; len];
@@ -979,77 +999,340 @@ async fn kdc_exchange(tcp: &mut TcpStream, request: &[u8]) -> std::io::Result<Ve
     Ok(answer)
 }
 
-/// Carries the crate's KDC requests: each datagram that arrives on `sock` (a loopback socket of
-/// ours, which the crate was given as the KDC's address; only the first sender's) goes over TCP,
-/// with a 4-byte length, through `open_tcp` to the KDC, and the answer goes back as a datagram.
-/// One exchange has `limit`: the dial within it with `open_tcp`'s own words, then what is left
-/// of it for the request and the answer (one timer at a time, so the same silence always gives
-/// the same message). Serves until dropped; returns only an error, which is the login's error.
-async fn kdc_relay(sock: UdpSocket, kdc: &Kdc, limit: Duration) -> Error {
-    let fail = |kind: Kind, reason: String| {
-        kerberos_error(
-            kind,
+/// One exchange with the KDC: dial what `kdc` names (through the proxy when there is one), write
+/// `request` with its length in one write, read the answer. `limit` covers the dial and the rest
+/// of the exchange; one timer at a time, so the same silence always gives the same message.
+async fn kdc_talk(kdc: &Kdc, request: &[u8], limit: Duration) -> Result<Vec<u8>> {
+    let t0 = Instant::now();
+    let mut tcp = open_tcp(&kdc.target, limit)
+        .await
+        .map_err(|e| kdc.failed(Kind::Connect, format!("{}{}", e.message, kdc.tail())))?;
+    let left = limit.saturating_sub(t0.elapsed());
+    match tokio::time::timeout(left, kdc_exchange(&mut tcp, request)).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(kdc.failed(Kind::Auth, e.to_string()))
+        }
+        Ok(Err(_)) => Err(kdc.failed(
+            Kind::Connect,
             format!(
-                "asking the KDC {} for a ticket for cifs/{}: {reason}",
-                hostport(&kdc.target.host, kdc.target.port),
-                kdc.host
+                "the KDC closed the connection without an answer{}",
+                kdc.tail()
             ),
-        )
-    };
-    let mut buf = vec![0u8; 65_536];
-    // The crate's socket is the first to write; a datagram from any other address is ignored
-    // (never sent on to the KDC with the proxy's credentials, never answered).
-    let mut owner = None;
-    loop {
-        let (n, from) = match sock.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => return kerberos_error(Kind::LocalIo, format!("the loopback socket: {e}")),
-        };
-        if *owner.get_or_insert(from) != from {
-            continue;
-        }
-        let t0 = Instant::now();
-        let mut tcp = match open_tcp(&kdc.target, limit).await {
-            Ok(s) => s,
-            Err(e) => return fail(Kind::Connect, format!("{}{}", e.message, kdc.tail())),
-        };
-        let left = limit.saturating_sub(t0.elapsed());
-        let answer = match tokio::time::timeout(left, kdc_exchange(&mut tcp, &buf[..n])).await {
-            Ok(Ok(a)) => a,
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
-                return fail(Kind::Auth, e.to_string());
-            }
-            Ok(Err(_)) => {
-                let reason = "the KDC closed the connection without an answer";
-                return fail(Kind::Connect, format!("{reason}{}", kdc.tail()));
-            }
-            Err(_) => {
-                let reason = format!(
-                    "connected to the KDC, but it did not answer within {}",
-                    span(limit)
-                );
-                return fail(Kind::Connect, format!("{reason}{}", kdc.tail()));
-            }
-        };
-        if answer.first() == Some(&0x7e)
-            && let Ok(e) = parse_krb_error(&answer)
-        {
-            let reason = kdc_error(
-                e.error_code,
-                e.e_text.as_deref(),
-                &kdc.host,
-                &kdc.user,
-                &kdc.realm,
-            );
-            return fail(Kind::Auth, reason);
-        }
-        if let Err(e) = sock.send_to(&answer, from).await {
-            return kerberos_error(Kind::LocalIo, format!("the loopback socket: {e}"));
-        }
+        )),
+        Err(_) => Err(kdc.failed(
+            Kind::Connect,
+            format!(
+                "connected to the KDC, but it did not answer within {}{}",
+                span(limit),
+                kdc.tail()
+            ),
+        )),
     }
 }
 
-/// SESSION_SETUP with the cache's ticket; with a ticket-granting ticket only, the relay beside it.
+// ---------------------------------------------------------------------------------------------
+// Kerberos: rsmb's own TGS exchange (RFC 4120 3.3)
+//
+// rsmb asks the KDC for the service ticket itself instead of leaving it to the crate. The crate's
+// TGS request carries a checksum over the KDC-REQ-BODY that a Windows KDC refuses with
+// KRB_AP_ERR_MODIFIED (41): it hashes the body with HMAC-MD5 keyed the RFC 3961 way, while an RC4
+// session key asks for Microsoft's profile (RFC 4757 7.1). Samba's KDC does not verify that
+// checksum, so the stage's tests never saw it (docs/plans/stage-5.md, V12).
+// The rest is the crate's: its encoders, parsers and RC4 crypto, its `compute_checksum` for AES.
+
+/// The encryption types rsmb offers the KDC for the service ticket, in the crate's order.
+const TGS_ETYPES: [EncryptionType; 3] = [
+    EncryptionType::Aes256CtsHmacSha196,
+    EncryptionType::Aes128CtsHmacSha196,
+    EncryptionType::Rc4Hmac,
+];
+
+/// The encryption type of a key, as the cache or the KDC names it.
+fn etype_of(n: i32) -> Option<EncryptionType> {
+    match n {
+        18 => Some(EncryptionType::Aes256CtsHmacSha196),
+        17 => Some(EncryptionType::Aes128CtsHmacSha196),
+        23 => Some(EncryptionType::Rc4Hmac),
+        _ => None,
+    }
+}
+
+/// Encrypt with a key usage: the RFC 3961 profile for the AES etypes (16-byte confounder,
+/// AES-CTS, HMAC-SHA1-96 over the confounder and the plaintext) and the crate's RC4-HMAC.
+fn kerberos_encrypt(key: &[u8], usage: u32, plain: &[u8], etype: EncryptionType) -> Vec<u8> {
+    match etype {
+        EncryptionType::Aes128CtsHmacSha196 | EncryptionType::Aes256CtsHmacSha196 => {
+            let ke = derive_key_aes(key, &usage_enc(usage));
+            let ki = derive_key_aes(key, &usage_int(usage));
+            let mut confounder = [0u8; 16];
+            getrandom::fill(&mut confounder).expect("no random bytes");
+            let mut full = confounder.to_vec();
+            full.extend_from_slice(plain);
+            let mac = hmac_sha1_96(&ki, &full);
+            let mut out = encrypt_aes_cts(&ke, &[0u8; 16], &full);
+            out.extend_from_slice(&mac);
+            out
+        }
+        EncryptionType::Rc4Hmac => encrypt_rc4_hmac(key, usage, plain),
+    }
+}
+
+/// Decrypt what `kerberos_encrypt` wrote, refusing a ciphertext whose HMAC does not match.
+fn kerberos_decrypt(
+    key: &[u8],
+    usage: u32,
+    cipher: &[u8],
+    etype: EncryptionType,
+) -> std::result::Result<Vec<u8>, String> {
+    if etype == EncryptionType::Rc4Hmac {
+        return decrypt_rc4_hmac(key, usage, cipher).map_err(|e| e.to_string());
+    }
+    if cipher.len() < 12 + 16 {
+        return Err("the AES ciphertext is too short".to_string());
+    }
+    let (data, mac) = cipher.split_at(cipher.len() - 12);
+    let ke = derive_key_aes(key, &usage_enc(usage));
+    let ki = derive_key_aes(key, &usage_int(usage));
+    let full = decrypt_aes_cts(&ke, &[0u8; 16], data).map_err(|e| e.to_string())?;
+    if hmac_sha1_96(&ki, &full) != mac {
+        return Err("the AES HMAC does not match".to_string());
+    }
+    Ok(full[16..].to_vec())
+}
+
+/// HMAC-SHA1 truncated to 96 bits, as the Kerberos AES profile uses it.
+fn hmac_sha1_96(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(key).expect("HMAC takes any key");
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    out[..12].to_vec()
+}
+
+/// The TGS request's checksum over the KDC-REQ-BODY, and its type: RFC 3961's profile for the AES
+/// etypes (the crate's `compute_checksum`) and Microsoft's HMAC-MD5 (type -138, RFC 4757 7.1) for
+/// RC4, which is the one a Windows KDC verifies.
+fn tgs_checksum(key: &[u8], etype: EncryptionType, body: &[u8]) -> (Vec<u8>, i32) {
+    // Key usage 6: PA-TGS-REQ padata AP-REQ Authenticator cksum (RFC 4120 7.5.1).
+    const USAGE: u32 = 6;
+    match etype {
+        EncryptionType::Aes256CtsHmacSha196 => (compute_checksum(key, USAGE, body, etype), 16),
+        EncryptionType::Aes128CtsHmacSha196 => (compute_checksum(key, USAGE, body, etype), 15),
+        EncryptionType::Rc4Hmac => (rc4_checksum(key, USAGE, body), -138),
+    }
+}
+
+/// Microsoft's HMAC-MD5, RFC 4757 section 7.1: `HMAC-MD5(ksign, MD5(usage ‖ body))` with
+/// `ksign = HMAC-MD5(key, "signaturekey\0")` and the usage little-endian.
+fn rc4_checksum(key: &[u8], usage: u32, body: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use md5::{Digest, Md5};
+    fn mac(key: &[u8], data: &[u8]) -> [u8; 16] {
+        let mut m = Hmac::<Md5>::new_from_slice(key).expect("HMAC takes any key");
+        m.update(data);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&m.finalize().into_bytes());
+        out
+    }
+    let ksign = mac(key, b"signaturekey\0");
+    let mut h = Md5::new();
+    h.update(usage.to_le_bytes());
+    h.update(body);
+    mac(&ksign, &h.finalize()).to_vec()
+}
+
+/// The Kerberos time of a message: `YYYYMMDDHHMMSSZ`, and the microseconds of the same instant.
+fn kerberos_now() -> (String, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (kerberos_time(now.as_secs()), now.subsec_micros())
+}
+
+/// `YYYYMMDDHHMMSSZ` for a time in seconds since the epoch (UTC, no leap seconds, as Kerberos).
+fn kerberos_time(secs: u64) -> String {
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let s = secs % 86_400;
+    format!(
+        "{y:04}{m:02}{d:02}{:02}{:02}{:02}Z",
+        s / 3600,
+        s / 60 % 60,
+        s % 60
+    )
+}
+
+/// The seconds since the epoch of a Kerberos time; None when the text is not `YYYYMMDDHHMMSSZ`.
+fn kerberos_secs(t: &str) -> Option<u64> {
+    let b = t.as_bytes();
+    if b.len() != 15 || b[14] != b'Z' || !b[..14].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let f = |r: std::ops::Range<usize>| t[r].parse::<i64>().ok();
+    let (y, mo, d) = (f(0..4)?, f(4..6)?, f(6..8)?);
+    let (h, mi, s) = (f(8..10)?, f(10..12)?, f(12..14)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    let days = days_from_civil(y, mo as u32, d as u32);
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + s).ok()
+}
+
+/// (year, month, day) of a day count since 1970-01-01 (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// The day count since 1970-01-01 of a date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Asks the KDC at `kdc` for `cifs/<host>` with the cache's ticket-granting ticket and returns a
+/// cache that holds the service ticket; the crate then builds the AP-REQ from it and asks no KDC.
+/// `limit` covers the whole exchange. The ticket in the cache is the TGT's own client, and what
+/// the KDC says about its end is what expiry is judged by.
+async fn tgs_exchange(t: &Target, k: &Ticket, kdc: &Kdc, limit: Duration) -> Result<CCache> {
+    let tgt = k.cache.find_tgt(&k.realm).ok_or_else(|| {
+        kdc.failed(
+            Kind::Auth,
+            format!("the cache holds no ticket-granting ticket for {}", k.realm),
+        )
+    })?;
+    let etype = etype_of(i32::from(tgt.key_etype)).ok_or_else(|| {
+        kdc.failed(
+            Kind::Auth,
+            format!(
+                "the ticket-granting ticket's encryption type {} is not one rsmb knows",
+                tgt.key_etype
+            ),
+        )
+    })?;
+    let ticket = parse_ticket(&tgt.ticket).map_err(|e| {
+        kdc.failed(
+            Kind::Auth,
+            format!("the cache's ticket-granting ticket: {e}"),
+        )
+    })?;
+    let cname = PrincipalName {
+        name_type: 1,
+        name_string: tgt.client.components.clone(),
+    };
+    let sname = PrincipalName {
+        name_type: 2,
+        name_string: vec!["cifs".to_string(), t.host.clone()],
+    };
+    // Below 2^31: a KDC reads a nonce whose DER INTEGER needed a leading zero byte as no request
+    // at all and closes the connection (measured on a Windows DC; the crate does the same).
+    let mut raw = [0u8; 4];
+    getrandom::fill(&mut raw).expect("no random bytes");
+    let nonce = u32::from_be_bytes(raw) & 0x7fff_ffff;
+    // The checksum covers the KDC-REQ-BODY as it goes on the wire, so build that first.
+    let body = encode_tgs_req_body(&k.realm, &sname, nonce, &TGS_ETYPES);
+    let (checksum, cksum_type) = tgs_checksum(&tgt.key_data, etype, &body);
+    let (ctime, cusec) = kerberos_now();
+    let plain = encode_authenticator(
+        &k.realm,
+        &cname,
+        &ctime,
+        cusec,
+        None,
+        None,
+        Some((&checksum, cksum_type)),
+    );
+    let cipher = kerberos_encrypt(&tgt.key_data, 7, &plain, etype);
+    let ap_req = encode_ap_req(
+        &ticket,
+        &EncryptedData {
+            etype: etype as i32,
+            kvno: None,
+            cipher,
+        },
+        false,
+    );
+    let request = encode_tgs_req(&k.realm, &sname, nonce, &TGS_ETYPES, &ap_req);
+    let answer = kdc_talk(kdc, &request, limit).await?;
+    if answer.first() == Some(&0x7e) {
+        let e = parse_krb_error(&answer)
+            .map_err(|e| kdc.failed(Kind::Auth, format!("the KDC's answer: {e}")))?;
+        let reason = kdc_error(
+            e.error_code,
+            e.e_text.as_deref(),
+            &kdc.host,
+            &kdc.user,
+            &kdc.realm,
+        );
+        return Err(kdc.failed(Kind::Auth, reason));
+    }
+    let rep = parse_kdc_rep(&answer)
+        .map_err(|e| kdc.failed(Kind::Auth, format!("the KDC's answer: {e}")))?;
+    let ticket_bytes = rep
+        .ticket
+        .raw_bytes
+        .clone()
+        .ok_or_else(|| kdc.failed(Kind::Auth, "the KDC's answer has no ticket".to_string()))?;
+    // The TGS-REP's encrypted part is encrypted with the ticket-granting ticket's session key:
+    // key usage 8 (RFC 4120 5.4.2), 9 when the KDC used a sub-session key.
+    let plain = match kerberos_decrypt(&tgt.key_data, 8, &rep.enc_part.cipher, etype) {
+        Ok(p) => p,
+        Err(_) => kerberos_decrypt(&tgt.key_data, 9, &rep.enc_part.cipher, etype).map_err(|e| {
+            kdc.failed(
+                Kind::Auth,
+                format!("the KDC's answer does not decrypt: {e}"),
+            )
+        })?,
+    };
+    let part = parse_enc_kdc_rep_part(&plain)
+        .map_err(|e| kdc.failed(Kind::Auth, format!("the KDC's answer: {e}")))?;
+    if etype_of(part.key.keytype).is_none() {
+        return Err(kdc.failed(
+            Kind::Auth,
+            format!(
+                "the KDC gave the service ticket an encryption type rsmb does not know ({})",
+                part.key.keytype
+            ),
+        ));
+    }
+    let authtime = kerberos_secs(&part.authtime).unwrap_or(u64::from(tgt.authtime)) as u32;
+    let endtime = kerberos_secs(&part.endtime).unwrap_or(u64::from(tgt.endtime)) as u32;
+    Ok(CCache {
+        version: 4,
+        default_principal: k.cache.default_principal.clone(),
+        credentials: vec![CcacheCredential {
+            client: tgt.client.clone(),
+            server: CcachePrincipal {
+                name_type: 2,
+                realm: k.realm.clone(),
+                components: vec!["cifs".to_string(), t.host.clone()],
+            },
+            key_etype: part.key.keytype as u16,
+            key_data: part.key.keyvalue.clone(),
+            authtime,
+            starttime: authtime,
+            endtime,
+            renew_till: tgt.renew_till,
+            ticket: ticket_bytes,
+        }],
+    })
+}
+
+/// SESSION_SETUP with the cache's ticket; with a ticket-granting ticket only, after rsmb has got
+/// the service ticket from the KDC and the cache holds it.
 async fn kerberos_setup(conn: &mut Connection, t: &Target, k: &Ticket) -> Result<()> {
     let what = format!(
         "login as '{}\\{}' at {}",
@@ -1057,23 +1340,18 @@ async fn kerberos_setup(conn: &mut Connection, t: &Target, k: &Ticket) -> Result
         k.user,
         hostport(&t.host, t.port)
     );
-    let mut creds = KerberosCredentials {
+    let creds = KerberosCredentials {
         username: k.user.clone(),
         password: String::new(),
         realm: k.realm.clone(),
-        // Never used with a service ticket: the crate takes it from the cache.
+        // Never used: the cache handed to the crate below holds the service ticket.
         kdc_address: "127.0.0.1:9".to_string(),
     };
-    let r = if k.service {
-        smb2::Session::setup_kerberos_from_ccache(conn, &creds, &t.host, &k.cache).await
+    let cache = if k.service {
+        k.cache.clone()
     } else {
         let files = krb5_files(std::env::var_os("KRB5_CONFIG").as_deref());
         let (host, port, from) = kdc_for(&files, &k.realm);
-        let loopback = |e: std::io::Error| {
-            kerberos_error(Kind::LocalIo, format!("cannot open a loopback socket: {e}"))
-        };
-        let sock = UdpSocket::bind("127.0.0.1:0").await.map_err(loopback)?;
-        creds.kdc_address = sock.local_addr().map_err(loopback)?.to_string();
         let kdc = Kdc {
             target: Target {
                 host,
@@ -1086,13 +1364,11 @@ async fn kerberos_setup(conn: &mut Connection, t: &Target, k: &Ticket) -> Result
             user: k.user.clone(),
             realm: k.realm.clone(),
         };
-        tokio::select! {
-            biased;
-            e = kdc_relay(sock, &kdc, DIAL_TIMEOUT) => return Err(e),
-            r = smb2::Session::setup_kerberos_from_ccache(conn, &creds, &t.host, &k.cache) => r,
-        }
+        tgs_exchange(t, k, &kdc, DIAL_TIMEOUT).await?
     };
-    r.map(drop)
+    smb2::Session::setup_kerberos_from_ccache(conn, &creds, &t.host, &cache)
+        .await
+        .map(drop)
         .map_err(|e| kerberos_refusal(e, &what, &t.host, &k.realm))
 }
 
@@ -4598,7 +4874,7 @@ THIRD.TEST = {
         (a, seen, accepted)
     }
 
-    fn relay_kdc(host: &str, port: u16, proxy: Option<Proxy>, from: Option<&str>) -> Kdc {
+    fn kdc_named(host: &str, port: u16, proxy: Option<Proxy>, from: Option<&str>) -> Kdc {
         Kdc {
             target: Target {
                 host: host.into(),
@@ -4613,31 +4889,11 @@ THIRD.TEST = {
         }
     }
 
-    /// The relay on a new loopback socket, run as a task: its address and its end.
-    async fn start_relay(
-        kdc: Kdc,
-        limit: Duration,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Error>) {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let a = sock.local_addr().unwrap();
-        (
-            a,
-            tokio::spawn(async move { kdc_relay(sock, &kdc, limit).await }),
-        )
-    }
-
-    /// The crate's side: one datagram to the relay.
-    async fn crate_sends(relay: std::net::SocketAddr, what: &[u8]) -> UdpSocket {
-        let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        c.send_to(what, relay).await.unwrap();
-        c
-    }
-
-    async fn relay_error(h: tokio::task::JoinHandle<Error>) -> Error {
-        let e = tokio::time::timeout(Duration::from_secs(5), h)
+    /// The error of an exchange that must fail, and its message starts as every KDC failure does.
+    async fn talk_error(kdc: Kdc, request: &[u8], limit: Duration) -> Error {
+        let e = kdc_talk(&kdc, request, limit)
             .await
-            .expect("the relay ended")
-            .unwrap();
+            .expect_err("the exchange was expected to fail");
         assert!(
             e.message.starts_with("Kerberos: asking the KDC "),
             "{}",
@@ -4646,92 +4902,42 @@ THIRD.TEST = {
         e
     }
 
-    /// Finding 1: only the first sender is served. A datagram from another socket reaches no KDC
-    /// and gets no answer, and the first sender's exchange goes on.
+    /// The KDC exchange: one request, one answer, the dial's and the proxy's errors in our words,
+    /// and the tails that say where the KDC's address came from.
     #[test]
-    fn kdc_relay_serves_the_first_sender_only() {
-        rt().block_on(async {
-            let (a, seen, _) = fake_kdc(Fake::Answer).await;
-            let (relay, h) =
-                start_relay(relay_kdc("127.0.0.1", a.port(), None, None), DIAL_TIMEOUT).await;
-            let ours = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut buf = [0u8; 100];
-            ours.send_to(b"ours", relay).await.unwrap();
-            let (n, _) = tokio::time::timeout(Duration::from_secs(5), ours.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(&buf[..n], b"answer to ours");
-            stranger.send_to(b"stranger", relay).await.unwrap();
-            let ms300 = Duration::from_millis(300);
-            assert!(
-                tokio::time::timeout(ms300, stranger.recv_from(&mut buf))
-                    .await
-                    .is_err(),
-                "the stranger got an answer"
-            );
-            ours.send_to(b"again", relay).await.unwrap();
-            let (n, _) = tokio::time::timeout(Duration::from_secs(5), ours.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(&buf[..n], b"answer to again");
-            let got = seen.lock().unwrap().clone();
-            assert_eq!(got.len(), 2, "the KDC saw {} requests", got.len());
-            assert!(got.iter().all(|m| !m.ends_with(b"stranger")));
-            assert!(!h.is_finished());
-            h.abort();
-        });
-    }
-
-    #[test]
-    fn kdc_relay_carries_the_exchange() {
+    fn kdc_talk_carries_the_exchange() {
         rt().block_on(async {
             let ms200 = Duration::from_millis(200);
-            // The answer is handed back, one datagram for one, a second one too.
+            // The answer is returned, and the request went out framed (4 bytes, then the DER).
             let (a, seen, _) = fake_kdc(Fake::Answer).await;
-            let (relay, h) = start_relay(relay_kdc("127.0.0.1", a.port(), None, None), DIAL_TIMEOUT).await;
-            let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let kdc = kdc_named("127.0.0.1", a.port(), None, None);
             for req in [&b"first request"[..], b"second"] {
-                c.send_to(req, relay).await.unwrap();
-                let mut buf = [0u8; 100];
-                let (n, from) = tokio::time::timeout(Duration::from_secs(5), c.recv_from(&mut buf))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(from, relay);
-                assert_eq!(&buf[..n], [b"answer to ".as_slice(), req].concat());
+                let answer = kdc_talk(&kdc, req, DIAL_TIMEOUT).await.unwrap();
+                assert_eq!(answer, [b"answer to ".as_slice(), req].concat());
             }
             let got = seen.lock().unwrap().clone();
             assert_eq!(got.len(), 2);
             assert_eq!(got[0], [&13u32.to_be_bytes()[..], b"first request"].concat());
-            assert!(!h.is_finished());
-            h.abort();
 
-            // A KRB-ERROR ends the login, and the crate gets nothing.
+            // A KRB-ERROR comes back as it is: `tgs_exchange` is what reads it.
             let (a, _, _) = fake_kdc(Fake::Refuse).await;
-            let (relay, h) = start_relay(relay_kdc("127.0.0.1", a.port(), None, None), DIAL_TIMEOUT).await;
-            let c = crate_sends(relay, b"req").await;
-            let e = relay_error(h).await;
-            assert_eq!(e.kind, Kind::Auth, "{}", e.message);
-            assert!(e.message.contains("has no service cifs/fs.rsmb.test"), "{}", e.message);
-            let mut buf = [0u8; 100];
-            assert!(
-                tokio::time::timeout(ms200, c.recv_from(&mut buf)).await.is_err(),
-                "the refusal was handed on"
-            );
+            let answer = kdc_talk(&kdc_named("127.0.0.1", a.port(), None, None), b"req", DIAL_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(answer, krb_error(7));
 
             // Connected and silent: one message, every time (one timer at a time); 20 at once.
             let (a, _, _) = fake_kdc(Fake::Silent).await;
             let t0 = Instant::now();
             let mut runs = Vec::new();
             for _ in 0..20 {
-                let (relay, h) = start_relay(relay_kdc("127.0.0.1", a.port(), None, None), ms200).await;
-                runs.push((crate_sends(relay, b"req").await, h));
+                runs.push(talk_error(
+                    kdc_named("127.0.0.1", a.port(), None, None),
+                    b"req",
+                    ms200,
+                ));
             }
-            for (_c, h) in runs {
-                let e = relay_error(h).await;
+            for e in futures_join(runs).await {
                 assert_eq!(e.kind, Kind::Connect, "{}", e.message);
                 assert!(
                     e.message.contains("connected to the KDC, but it did not answer within 200 ms"),
@@ -4745,17 +4951,13 @@ THIRD.TEST = {
             let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = closed.local_addr().unwrap().port();
             drop(closed);
-            let (relay, h) = start_relay(relay_kdc("127.0.0.1", port, None, None), DIAL_TIMEOUT).await;
-            let _c = crate_sends(relay, b"req").await;
-            let e = relay_error(h).await;
+            let e = talk_error(kdc_named("127.0.0.1", port, None, None), b"req", DIAL_TIMEOUT).await;
             assert_eq!(e.kind, Kind::Connect);
             assert!(e.message.contains("Connection refused"), "{}", e.message);
 
             // A KDC that closes after the request.
             let (a, _, _) = fake_kdc(Fake::Close).await;
-            let (relay, h) = start_relay(relay_kdc("127.0.0.1", a.port(), None, None), DIAL_TIMEOUT).await;
-            let _c = crate_sends(relay, b"req").await;
-            let e = relay_error(h).await;
+            let e = talk_error(kdc_named("127.0.0.1", a.port(), None, None), b"req", DIAL_TIMEOUT).await;
             assert_eq!(e.kind, Kind::Connect);
             assert!(
                 e.message.contains("the KDC closed the connection without an answer"),
@@ -4765,9 +4967,13 @@ THIRD.TEST = {
 
             // Through a proxy: the KDC's name goes to the proxy as a name.
             let (p, seen) = fake_proxy("127.0.0.1:0", &[5, 0], 0, 0).await;
-            let (relay, h) = start_relay(relay_kdc("kdc.invalid", 88, Some(p), None), ms200).await;
-            let _c = crate_sends(relay, b"req").await;
-            relay_error(h).await;
+            let e = talk_error(
+                kdc_named("kdc.invalid", 88, Some(p), None),
+                b"req",
+                ms200,
+            )
+            .await;
+            assert_eq!(e.kind, Kind::Connect, "{}", e.message);
             let mut want = vec![5, 1, 0, 3, 11];
             want.extend(b"kdc.invalid");
             want.extend(88u16.to_be_bytes());
@@ -4778,9 +4984,7 @@ THIRD.TEST = {
                 let (a, _, accepted) = fake_kdc(Fake::Answer).await;
                 let (p, _) = fake_proxy("127.0.0.1:0", &[5, 0], 0, 5).await;
                 let proxy = hostport(&p.host, p.port);
-                let (relay, h) = start_relay(relay_kdc(host, a.port(), Some(p), None), DIAL_TIMEOUT).await;
-                let _c = crate_sends(relay, b"req").await;
-                let e = relay_error(h).await;
+                let e = talk_error(kdc_named(host, a.port(), Some(p), None), b"req", DIAL_TIMEOUT).await;
                 assert_eq!(e.kind, Kind::Connect);
                 let words = format!("proxy {proxy}: cannot reach {host}:{}: connection refused", a.port());
                 assert!(e.message.contains(&words), "{words}: {}", e.message);
@@ -4798,11 +5002,13 @@ THIRD.TEST = {
             let mut runs = Vec::new();
             for _ in 0..20 {
                 let p = Proxy { host: sa.ip().to_string(), port: sa.port(), auth: None };
-                let (relay, h) = start_relay(relay_kdc("kdc.invalid", 88, Some(p), None), ms200).await;
-                runs.push((crate_sends(relay, b"req").await, h));
+                runs.push(talk_error(
+                    kdc_named("kdc.invalid", 88, Some(p), None),
+                    b"req",
+                    ms200,
+                ));
             }
-            for (_c, h) in runs {
-                let e = relay_error(h).await;
+            for e in futures_join(runs).await {
                 assert_eq!(e.kind, Kind::Connect);
                 assert!(
                     e.message.contains(
@@ -4817,22 +5023,144 @@ THIRD.TEST = {
             let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = closed.local_addr().unwrap().port();
             drop(closed);
-            let (relay, h) =
-                start_relay(relay_kdc("127.0.0.1", port, None, Some("/home/u/k.conf")), DIAL_TIMEOUT).await;
-            let _c = crate_sends(relay, b"req").await;
-            let e = relay_error(h).await;
+            let e = talk_error(
+                kdc_named("127.0.0.1", port, None, Some("/home/u/k.conf")),
+                b"req",
+                DIAL_TIMEOUT,
+            )
+            .await;
             assert!(
                 e.message.contains("(the KDC is the one /home/u/k.conf names for RSMB.TEST)"),
                 "{}",
                 e.message
             );
-            let (relay, h) = start_relay(relay_kdc("127.0.0.1", port, None, None), DIAL_TIMEOUT).await;
-            let _c = crate_sends(relay, b"req").await;
-            let e = relay_error(h).await;
+            let e = talk_error(kdc_named("127.0.0.1", port, None, None), b"req", DIAL_TIMEOUT).await;
             for w in ["so the realm's name was tried", "KRB5_CONFIG", "kvno cifs/fs.rsmb.test"] {
                 assert!(e.message.contains(w), "{w}: {}", e.message);
             }
             assert!(!e.message.contains("/etc/krb5.conf"), "{}", e.message);
         });
+    }
+
+    /// Twenty exchanges side by side, their errors in the order they were started.
+    async fn futures_join<T: Send + 'static>(
+        runs: Vec<impl std::future::Future<Output = T> + Send + 'static>,
+    ) -> Vec<T> {
+        let mut set = JoinSet::new();
+        for f in runs {
+            set.spawn(f);
+        }
+        let mut out = Vec::new();
+        while let Some(r) = set.join_next().await {
+            out.push(r.unwrap());
+        }
+        out
+    }
+
+    /// The service ticket is asked for with the cache's ticket-granting ticket; without one there
+    /// is nothing to ask with, before any dial.
+    #[test]
+    fn tgs_exchange_needs_a_tgt() {
+        rt().block_on(async {
+            let t = local_target(445, None);
+            let k = Ticket {
+                cache: CCache {
+                    version: 4,
+                    default_principal: CcachePrincipal {
+                        name_type: 1,
+                        realm: "RSMB.TEST".into(),
+                        components: vec!["tester".into()],
+                    },
+                    credentials: Vec::new(),
+                },
+                user: "tester".into(),
+                realm: "RSMB.TEST".into(),
+                service: false,
+            };
+            let e = tgs_exchange(&t, &k, &kdc_named("127.0.0.1", 9, None, None), DIAL_TIMEOUT)
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind, Kind::Auth, "{}", e.message);
+            assert!(
+                e.message
+                    .contains("the cache holds no ticket-granting ticket for RSMB.TEST"),
+                "{}",
+                e.message
+            );
+        });
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// The TGS request's checksum is the profile each etype asks for: RFC 4757's Microsoft
+    /// HMAC-MD5 for RC4 (the value from impacket, which MIT krb5 agrees with byte for byte) and
+    /// RFC 3961's for AES. The crate's RC4 checksum is a different value, which a Windows KDC
+    /// answers with KRB_AP_ERR_MODIFIED (docs/plans/stage-5.md, V12).
+    #[test]
+    fn tgs_checksums_are_the_profiles_of_their_etypes() {
+        let key: Vec<u8> = (0u8..16).collect();
+        let body = b"the KDC-REQ-BODY";
+        let (ck, kind) = tgs_checksum(&key, EncryptionType::Rc4Hmac, body);
+        assert_eq!(hex(&ck), "25a2dd39c1fbbf44bd130ca372d40394");
+        assert_eq!(kind, -138);
+        assert_ne!(ck, compute_checksum(&key, 6, body, EncryptionType::Rc4Hmac));
+        let key: Vec<u8> = (0u8..32).collect();
+        let (ck, kind) = tgs_checksum(&key, EncryptionType::Aes256CtsHmacSha196, body);
+        assert_eq!(hex(&ck), "3b43cf8861e945d5e93e64d1");
+        assert_eq!(kind, 16);
+        let key: Vec<u8> = (0u8..16).collect();
+        let (ck, kind) = tgs_checksum(&key, EncryptionType::Aes128CtsHmacSha196, body);
+        assert_eq!(ck.len(), 12);
+        assert_eq!(kind, 15);
+    }
+
+    /// The time of a message: the wire format, both ways, with the leap day and the month ends.
+    #[test]
+    fn kerberos_times_are_the_wire_format() {
+        assert_eq!(kerberos_time(0), "19700101000000Z");
+        assert_eq!(kerberos_time(1_700_000_000), "20231114221320Z");
+        assert_eq!(kerberos_time(951_782_400), "20000229000000Z");
+        for secs in [0, 1, 951_782_400, 1_700_000_000, 4_102_444_800] {
+            assert_eq!(kerberos_secs(&kerberos_time(secs)), Some(secs), "{secs}");
+        }
+        assert_eq!(kerberos_secs("20261118223704Z"), Some(1_795_041_424));
+        for bad in [
+            "",
+            "2026",
+            "20261118223704",
+            "20261118223704z",
+            "20261318223704Z",
+            "20260132223704Z",
+            "2026111822370xZ",
+        ] {
+            assert_eq!(kerberos_secs(bad), None, "{bad}");
+        }
+    }
+
+    /// What rsmb encrypts it can decrypt, for both key families; a changed byte is refused.
+    #[test]
+    fn kerberos_encryption_round_trips() {
+        for (etype, key) in [
+            (EncryptionType::Rc4Hmac, vec![7u8; 16]),
+            (EncryptionType::Aes128CtsHmacSha196, vec![8u8; 16]),
+            (EncryptionType::Aes256CtsHmacSha196, vec![9u8; 32]),
+        ] {
+            let plain = b"the authenticator, as DER";
+            let cipher = kerberos_encrypt(&key, 7, plain, etype);
+            assert_eq!(kerberos_decrypt(&key, 7, &cipher, etype).unwrap(), plain);
+            let mut bad = cipher.clone();
+            let last = bad.len() - 1;
+            bad[last] ^= 1;
+            assert!(
+                kerberos_decrypt(&key, 7, &bad, etype).is_err(),
+                "{etype:?} accepted a changed ciphertext"
+            );
+            assert!(
+                kerberos_decrypt(&key, 8, &cipher, etype).is_err(),
+                "{etype:?}"
+            );
+        }
     }
 }

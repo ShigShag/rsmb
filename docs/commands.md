@@ -903,10 +903,13 @@ no service ticket it obtained, and **never falls back to a password** (NTLM) whe
 
   and set `KRB5_CONFIG` to it.
 - **The ticket-granting ticket must be forwardable and renewable** (`kinit -f`; add `-r 7d` where
-  it is not renewable): rsmb asks for a forwardable, renewable service ticket (the library's fixed
-  options), and a KDC that enforces RFC 4120, as Samba's does, refuses that for a ticket-granting
-  ticket that is not both (`KDC_ERR_BADOPTION`). The other way out: put the service ticket into the
-  cache with `kvno cifs/<host>`.
+  it is not renewable): rsmb asks for a forwardable, renewable service ticket (the options of RFC
+  4120 and of impacket, `0x40810010`), and a KDC that enforces RFC 4120, as Samba's does, refuses
+  that for a ticket-granting ticket that is not both (`KDC_ERR_BADOPTION`). The other way out: put
+  the service ticket into the cache with `kvno cifs/<host>`. rsmb builds that request itself (the
+  crate's is refused by a Windows KDC; `docs/library-decision.md`), and the checksum it carries is
+  the one each encryption type asks for: RFC 4757's HMAC-MD5 (type -138) for an RC4
+  ticket-granting ticket, RFC 3961's for AES.
 - **Through `--proxy`** the KDC is reached through the proxy too, by name (the proxy resolves it),
   and nothing goes around the proxy: no packet, no name lookup on this host.
 - **Expiry.** A ticket whose end time is not after now (this host's clock, no allowance) is
@@ -952,6 +955,11 @@ no service ticket it obtained, and **never falls back to a password** (NTLM) whe
   | KRB-ERROR 32 | `auth` | `the KDC says the ticket-granting ticket has expired; run kinit` |
   | KRB-ERROR 36 | `auth` | `the KDC does not accept the ticket-granting ticket for '<user>@<realm>' (KRB_AP_ERR_BADMATCH)` |
   | KRB-ERROR 37 | `auth` | `the clocks of this host and the KDC differ too much` |
+  | KRB-ERROR 41 | `auth` | `the KDC could not verify the request with the ticket-granting ticket for '<user>@<realm>' (KRB_AP_ERR_MODIFIED): the ticket's key does not match this KDC, or the cache is for another realm; run kinit` |
+  | the answer is neither a KRB-ERROR nor a TGS-REP rsmb can read | `auth` | `the KDC's answer: <the library's words>`, for example `the KDC's answer: Invalid data: DER: truncated TLV` |
+  | the TGS-REP does not decrypt with the ticket-granting ticket's key | `auth` | `the KDC's answer does not decrypt: <why>` (the ticket's key does not match this KDC) |
+  | the cache's ticket-granting ticket cannot be parsed | `auth` | `the cache's ticket-granting ticket: <the library's words>` |
+  | the service ticket's encryption type is new to rsmb | `auth` | `the KDC gave the service ticket an encryption type rsmb does not know (<n>)` |
   | any other KRB-ERROR | `auth` | `KDC error <code>`, and `: <text>` when the KDC sent one |
 
   The three `connect` rows say where the address came from: ` (the KDC is the one <file> names
@@ -1001,7 +1009,9 @@ KRB5CCNAME=/tmp/krb5cc_rsmb rsmb -k --proxy socks5://127.0.0.1:1080 -H fs1.corp.
   rsmb does the same when no `krb5.conf` names a KDC for the realm. Against Samba's KDC
   smbclient-ng fails with every cache that holds only a ticket-granting ticket
   (`KRB_AP_ERR_INAPP_CKSUM`: its TGS request carries no checksum), while rsmb logs in with one that
-  is forwardable and renewable; with the service ticket in the cache both log in.
+  is forwardable and renewable; with the service ticket in the cache both log in. Against a
+  Windows KDC the checksum is the other way round: rsmb sends the RFC 4757 profile that a Windows
+  KDC verifies, where the library rsmb builds on does not (V12 of `docs/plans/stage-5.md`).
 - `shares` always shows the access to each share, from the TREE_CONNECT answer (1 more round
   trip for the whole list). smbclient-ng shows rights only with `shares -R`: per share a tree
   connect and a listing of the root, one after another, and it reports READ or NO ACCESS (its

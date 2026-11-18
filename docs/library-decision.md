@@ -349,8 +349,9 @@ Behaviours rsmb designs around (`docs/architecture.md`, "Kerberos"):
 
 | Behaviour | Measured | Consequence |
 |---|---|---|
-| The KDC client opens its own sockets, with no hook: UDP first (3 attempts, 10 s each, 1 s and 2 s between), then TCP the same way, to `KerberosCredentials::kdc_address` | through a SOCKS5 proxy it dials the KDC directly (the KDC's log names the host's address); a closed port 88: 36.0 s, then `Io(ConnectionRefused)`; a silent KDC: 66.0 s, then `Timeout`; this KDC answers a UDP TGS request with `RESPONSE_TOO_BIG`, so every exchange costs a wasted round trip | rsmb gives the crate a loopback UDP address of its own and relays each request over TCP through its own dialer (the relay): through the proxy, 10 s, its own messages, no wasted round trip |
-| The TGS request has fixed KDC options `0x40810010` (forwardable, renewable, canonicalize, renewable-ok); `kerberos_encrypt` and `kerberos_decrypt` are `pub(crate)` | a TGT that is not forwardable (MIT `kinit` without `-f`) or not renewable (Heimdal's default) gets KRB-ERROR 13 (`KDC_ERR_BADOPTION`) from Heimdal | a documented limit with a message that names `kinit -f` and `kvno cifs/<host>`; a defect to report upstream (the options should follow the TGT's flags) |
+| The KDC client opens its own sockets, with no hook: UDP first (3 attempts, 10 s each, 1 s and 2 s between), then TCP the same way, to `KerberosCredentials::kdc_address` | through a SOCKS5 proxy it dials the KDC directly (the KDC's log names the host's address); a closed port 88: 36.0 s, then `Io(ConnectionRefused)`; a silent KDC: 66.0 s, then `Timeout`; this KDC answers a UDP TGS request with `RESPONSE_TOO_BIG`, so every exchange costs a wasted round trip | the crate's KDC client is not used: rsmb writes the TGS request itself and asks the KDC with `open_tcp` (one TCP exchange, through the proxy by name), so the 36 s, the 66 s and the wasted round trip are gone (`architecture.md` 5, 6) |
+| The TGS request's authenticator checksum for an RC4 session key is `HMAC-MD5(HMAC-MD5(key, usage), body)` | a Windows Server AD DC refuses it with KRB-ERROR 41 (`KRB_AP_ERR_MODIFIED`) for every service, while Samba's Heimdal KDC answers the same request without looking at the checksum; RFC 4757 7.1 and MIT `kvno` use `HMAC-MD5(HMAC-MD5(key, "signaturekey\0"), MD5(usage ‖ body))` | rsmb computes the checksum itself (type -138 for RC4, RFC 3961's 15/16 for AES) and sends no other; a known-answer test ties it to impacket's value (`docs/plans/stage-5.md`, V12). A defect to report upstream |
+| The TGS request has fixed KDC options `0x40810010` (forwardable, renewable, canonicalize, renewable-ok); `kerberos_encrypt` and `kerberos_decrypt` are `pub(crate)` | a TGT that is not forwardable (MIT `kinit` without `-f`) or not renewable (Heimdal's default) gets KRB-ERROR 13 (`KDC_ERR_BADOPTION`) from Heimdal | rsmb keeps those options, so the limit and its message (`kinit -f`, `kvno cifs/<host>`) stay; reading the TGT's flags would be a second cache parser. The crypto wrappers are why rsmb carries `hmac`, `md-5`, `sha1` and `getrandom` for its own AES and RC4 paths |
 | `CCache::find_service_ticket` and `find_tgt` take the first match and do not look at the end time | an expired entry is used; the server answers it `STATUS_INVALID_PARAMETER` (more than five minutes past its end) or accepts it and ends the session at the next request (`SessionExpired`) | rsmb removes every entry whose end time is not after now before the crate sees the cache, and says which ticket expired |
 | `parse_ccache` allocates what the file claims: a principal that claims 4,294,967,295 name parts | `memory allocation of 103079215080 bytes failed`, exit 134 | not guarded (a guard would be a second parser); documented; to report upstream. A cache cut inside an entry is read up to the cut |
 | `load_ccache(None)` reads `KRB5CCNAME` and has no default, although its comment promises `/tmp/krb5cc_<uid>` | an error without the variable | rsmb finds the file itself (`KRB5CCNAME`, else `/tmp/krb5cc_<uid>`) and reads it with `std::fs` |
@@ -358,11 +359,17 @@ Behaviours rsmb designs around (`docs/architecture.md`, "Kerberos"):
 `spikes/smb-rs/run.sh` clones upstream smb-rs into `target/smb-rs-src` to apply the patches, so it
 needs network access the first time.
 
+The three Kerberos defects above that rsmb now steps around — the checksum, the dial and the
+options — should be reported upstream; the pin policy (`docs/plans/master-plan.md` 4.2) keeps
+`smb2` at `=0.43.0` until an upgrade is its own change.
+
 ## Not verified
 
-- Any Windows server (see `docs/known-limitations.md`).
-- `smb2`: the reconnect hooks, `set_keepalive`; Kerberos against a Windows KDC or server, or an
-  MIT KDC (Stage 5 measured a Samba AD DC only). (Stage 2 has measured what was listed
+- Any Windows server beyond the Kerberos exchange of `docs/plans/stage-5.md`,
+  V12 (see `docs/known-limitations.md`).
+- `smb2`: the reconnect hooks, `set_keepalive`; Kerberos against an MIT KDC (Stage 5 measured a
+  Samba AD DC only; a Windows Server AD DC was measured by hand for the TGS exchange and the
+  login with an RC4 ticket-granting ticket). (Stage 2 has measured what was listed
   here before: `over4g.bin` down and up in full (`over_4g`, and at the slow endpoint in the bench),
   repeated transfers at the slow endpoint (`bench-rsmb.sh transfers`), an encrypted share with
   `medium.bin` each way (`edge_and_encrypted`).)

@@ -15,7 +15,7 @@ transfers, each with its test, are in [`transfers.md`](transfers.md).
 | File | Holds |
 |---|---|
 | `src/main.rs` | `Args` (clap) and `options()` (the flags as the manual prints them), the start-up rules (password, `-S`/`-C`/stdin), the runtime, signal handling, `run_blocking`, the non-interactive runner, exit |
-| `src/session.rs` | `Target`, `Proxy`, the dialer and the transport halves, login (NTLM, or Kerberos: the ticket cache, `krb5.conf`, the KDC relay, the Kerberos messages), `Session` (connection, tree map, share, working directory, cache, kept share list, the registry of remote temporary files and the writer slot), the `cd` check and `open_close`, the listing (`plan`, the entry parser, both phases), the share list, `Cache` and its `invalidate`, reconnect, `Error`, `Kind`, `classify`, `valid_name` and `crate_path`, `Remote` (every request of a transfer, `mkdir`, `rm`, `rmdir`), `finish` and `cleanup`. **All use of `smb2` is in this file** |
+| `src/session.rs` | `Target`, `Proxy`, the dialer and the transport halves, login (NTLM, or Kerberos: the ticket cache, `krb5.conf`, rsmb's TGS exchange, the Kerberos messages), `Session` (connection, tree map, share, working directory, cache, kept share list, the registry of remote temporary files and the writer slot), the `cd` check and `open_close`, the listing (`plan`, the entry parser, both phases), the share list, `Cache` and its `invalidate`, reconnect, `Error`, `Kind`, `classify`, `valid_name` and `crate_path`, `Remote` (every request of a transfer, `mkdir`, `rm`, `rmdir`), `finish` and `cleanup`. **All use of `smb2` is in this file** |
 | `src/transfer.rs` | `get`, `put`, `cat`: temporary names (`temp_name`, `is_temp_name`), `local_component`, `LocalTemp`, the target rules (`local_target`, `remote_target`), the recursive transfers, the local walk of `put -r`, `Progress` |
 | `src/walk.rs` | `walk`: the one traversal routine (16 listings in flight or waiting, results in queue order, a stop, the loop check by file id, the caps for servers without ids), generic over the function that lists a directory; `Listing`, `Dir`, `Report`. The pure parts of `tree` and `find`: `Glob`, `parse_size`, `parse_depth`, `Filter`, `draw_tree`, `end_report`, `TREE_MAX` |
 | `src/commands.rs` | `COMMANDS` (the command table), `CmdId`, `Arg`, `Args`, `run_line` (and the overwrite prompt's `Flow::Confirm`), argument and flag splitting (flags with a value), the command functions (`mkdir`, `rm`, `rmdir`, `lcd`, `lpwd`, `lls`, `tree`, `find` and their `run_walk` here; `get`, `put`, `cat` call `transfer`), `Out` (text or JSON lines, raw bytes for `cat`, item errors, `diag`, `written`), `entry_obj`, help rendering, time formatting |
@@ -170,37 +170,40 @@ Kerberos, who the cache says we are.
 4. **`kerberos_setup`**: NEGOTIATE as for NTLM, then `smb2::Session::setup_kerberos_from_ccache`
    with the user and realm as the cache spells them (the crate needs that spelling) and SPN
    `cifs/<-H as given>`. With the service ticket in the cache the crate builds the AP-REQ at once:
-   1 SESSION_SETUP, no KDC. With a TGT only the crate runs a TGS exchange with
-   `KerberosCredentials::kdc_address`.
-5. **The relay.** The crate's KDC client opens its own sockets (UDP first: 3 attempts of 10 s,
-   then TCP the same way), with no hook: left alone it would dial around the proxy, take 36 s for
-   a closed port and 66 s for a silent KDC, and report both as a lost connection. So the crate is
-   always given **a loopback address of ours** as the KDC: a `UdpSocket` on `127.0.0.1:0`, open
-   only while that login runs. `kdc_relay` takes each datagram the first sender (the crate's
-   socket) sends there and ignores every other address (so another local process cannot make
-   rsmb dial the KDC through the user's proxy with its credentials, or read an answer), dials the
-   KDC with **`open_tcp`** (so `TCP_NODELAY`, through the proxy with its login when there is one,
-   the KDC's name resolved by the proxy, never around it), writes the 4-byte length and the
-   request in one write, reads the answer and sends it back as a datagram. Because the relay *is*
-   the crate's UDP peer, the crate's UDP-first costs nothing and its fallback to TCP never runs.
-   `kerberos_setup` runs the relay beside the setup in a `biased` `select!`: the relay returns
-   only its error, so the login ends exactly when the KDC exchange failed. **One timer at a
+   1 SESSION_SETUP, no KDC. With a TGT only, rsmb gets the service ticket from the KDC first
+   (5) and hands the crate a cache that holds it, so the crate itself never asks a KDC.
+5. **The TGS exchange is rsmb's own** (`tgs_exchange`, RFC 4120 3.3). The crate's request is
+   refused by a Windows KDC: for an RC4 session key the crate computes the authenticator's
+   checksum by a profile of its own, while an RC4 key asks for Microsoft's HMAC-MD5 (RFC 4757
+   7.1; type -138), and the KDC answers `KRB_AP_ERR_MODIFIED` (41). Samba's KDC does not verify
+   that checksum, so no test of Stage 5 could see it (`docs/plans/stage-5.md`, V12). rsmb builds
+   the request from the crate's pieces: `encode_tgs_req_body`, `encode_authenticator` with a
+   checksum over exactly that body (key usage 6; -138 for RC4,
+   15/16 for AES), `encode_ap_req` with the TGT the crate parsed, and `encode_tgs_req` with the
+   crate's options (`0x40810010`: forwardable, renewable, renewable-ok, canonicalize). The
+   authenticator is encrypted with the TGT's session key, usage 7: RC4 through the crate's
+   `encrypt_rc4_hmac`, AES through `derive_key_aes`, `encrypt_aes_cts` and HMAC-SHA1-96
+   (rsmb's own 20 lines, because the crate's wrapper is `pub(crate)`). The answer is a KRB-ERROR
+   (`kdc_error` words it) or a TGS-REP, whose encrypted part is decrypted with the TGT's key —
+   usage 8, then 9 — to give the service session key. rsmb then gives the crate a `CCache` of
+   its own with that ticket, so the AP-REQ is still the crate's. The nonce stays below 2^31: a
+   Windows KDC closes the connection without any answer for a nonce whose DER INTEGER needed a
+   leading zero byte (measured; the crate does the same). Because the options are unchanged, a
+   TGT that is not forwardable and renewable is still refused with `KDC_ERR_BADOPTION`.
+6. **`kdc_talk`.** One exchange: `open_tcp` dials the KDC (so `TCP_NODELAY`, through the proxy
+   with its login when there is one, the KDC's name resolved by the proxy, never around it),
+   writes the 4-byte length and the request in one write, reads the answer. **One timer at a
    time**: `open_tcp` has the 10 s (`DIAL_TIMEOUT`) and reports in its own words; what is left of
    the 10 s bounds the write and the read (`connected to the KDC, but it did not answer within
-   10 s`), so the same silence always gives the same message. An answer that is a KRB-ERROR (it
-   starts `0x7e` and parses with the crate's `parse_krb_error`) is not handed on: `kdc_error`
-   words it, and the login ends. A new TCP connection per datagram (the crate sends one, or the
-   same again after its own 10 s). The crate's own socket is another matter: it binds
-   `0.0.0.0:0` and takes the first datagram from anyone (`smb2` `kdc.rs`, `send_udp`), so during
-   the TGT-only login that socket listens on every interface on an ephemeral port; see
-   `docs/known-limitations.md`.
-6. **`kdc_for`**: the KDC is the first `kdc` of the realm in the first of `krb5_files(KRB5_CONFIG)`
+   10 s`), so the same silence always gives the same message. `Kdc::failed` words every failure
+   with what was asked for, and `Kdc::tail` says where the KDC's address came from.
+7. **`kdc_for`**: the KDC is the first `kdc` of the realm in the first of `krb5_files(KRB5_CONFIG)`
    that names one (`krb5_kdc` counts braces, so a `kdc` in a nested block or another realm's block
    is not taken; `[v6]:port`, a bare IPv6 address, `host:port`, `tcp/` and `udp/` prefixes;
    `http` KDCs skipped; a file that is not a regular file counts as unreadable: absent), else the
    realm's own name in lower case, port 88. The environment is read
    in `kerberos_setup` only, so both functions are tested without it.
-7. **Errors.** `kerberos_refusal` turns the crate's error from the setup into ours: a lost
+8. **Errors.** `kerberos_refusal` turns the crate's error from the setup into ours: a lost
    connection as `classify` says; an error with a status that `classify` calls `auth` keeps
    `login refused`; any other status is `the server did not accept the ticket (<status>)`; no
    status means the crate raised it itself (an unknown encryption type, a ticket or a KDC answer
@@ -210,8 +213,9 @@ Kerberos, who the cache says we are.
    `commands.md`, "Kerberos".
 
 rsmb writes no cache and keeps no service ticket it obtained: every TGT-only login asks the KDC
-once. No new dependency: the crate does the Kerberos, `libc::getuid` and tokio's UDP socket the
-rest.
+once. The dependencies rsmb adds for that exchange are `hmac`, `md-5`, `sha1` and `getrandom`
+(all already in the tree through the crate, whose Kerberos crypto wrappers are `pub(crate)`);
+`libc::getuid` checks the cache's owner.
 
 ### Tree map and the rule "every method that sends starts with `tree()`"
 
@@ -375,7 +379,7 @@ connection shows as an error in each answer of the compound, not as an error of 
   extends one request's deadline to at most 6 × `--timeout`, so **one reply must be complete
   within 6 × `--timeout`** (180 s by default). Connecting has its own 10 s (`DIAL_TIMEOUT`, the
   whole dial, through a proxy too), and so does the KDC exchange of a Kerberos login with a TGT
-  (the relay's dial, then what is left of the 10 s for the request and the answer).
+  (the dial to the KDC, then what is left of the 10 s for the request and the answer).
 - **A Kerberos session ends with its ticket.** The server then answers every request
   `STATUS_NETWORK_SESSION_EXPIRED`, which the crate reports as `SessionExpired`; `classify` makes
   it `connection_lost` (`the server ended the session (with -k: the ticket's lifetime is over)`),
@@ -434,7 +438,8 @@ removed), printed as `path` and `left_behind`. `classify(e, what)` maps the crat
 violation is `other`, "in use by another client"); a response frame with an error status is turned
 into the crate's `Protocol` error first, so there is one mapping. Messages read `<what>: <reason>` (`/nope: not
 found`, `share 'nope': not found`); a lost connection reads `connection lost: …`. A Kerberos
-failure is not classified: it is built where it happens (the cache, the relay, `kerberos_refusal`),
+failure is not classified: it is built where it happens (the cache, the KDC exchange,
+`kerberos_refusal`),
 starts `Kerberos: ` and is `auth` or `connect` (no kind of its own).
 
 Exit codes: `usage` 2, `interrupted` 130, any other error 3 at start-up and 1 later.
