@@ -1,0 +1,37 @@
+diff --git a/crates/smb/src/resource/pipe.rs b/crates/smb/src/resource/pipe.rs
+index 4f5d702..9332046 100644
+--- a/crates/smb/src/resource/pipe.rs
++++ b/crates/smb/src/resource/pipe.rs
+@@ -6,7 +6,7 @@ use std::{
+ use super::ResourceHandle;
+ use crate::msg_handler::{OutgoingMessage, ReceiveOptions};
+ use maybe_async::*;
+-use smb_msg::{IoctlBuffer, PipeTransceiveRequest, ReadRequest, WriteRequest};
++use smb_msg::{IoctlBuffer, PipeTransceiveRequest, ReadRequest, Status, WriteRequest};
+ use smb_rpc::{SmbRpcError, interface::*, ndr64::NDR64_SYNTAX_ID, pdu::*};
+ pub struct Pipe {
+     handle: ResourceHandle,
+@@ -24,6 +24,23 @@ impl Pipe {
+     {
+         PipeRpcConnection::bind::<I>(self).await
+     }
++
++    /// Reads up to `length` bytes from the pipe, e.g. the rest of an RPC reply after
++    /// FSCTL_PIPE_TRANSCEIVE returned STATUS_BUFFER_OVERFLOW.
++    pub async fn read(&self, length: u32) -> crate::Result<Vec<u8>> {
++        let request = ReadRequest {
++            flags: Default::default(),
++            length,
++            offset: 0,
++            file_id: self.handle.file_id()?,
++            minimum_count: 0,
++        };
++        let options = ReceiveOptions::new()
++            .with_allow_async(true)
++            .with_status(&[Status::Success, Status::BufferOverflow]);
++        let response = self.handle.send_recvo(request.into(), options).await?;
++        Ok(response.message.content.to_read()?.buffer)
++    }
+ }
+ 
+ pub struct PipeRpcConnection {

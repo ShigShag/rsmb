@@ -1,0 +1,151 @@
+== step 1 (pin)
+== step 1 (patched)
+== step 2 (pin)
+== step 2 (patched)
+== step 3 (patched)
+== step 4 (patched)
+== step 5 (pin)
+== step 5 (patched)
+== step 6 (patched)
+== step 7 (patched)
+== step 7c (patched)
+== step 8 (patched)
+== step 9 (patched)
+== step 10 (patched)
+== step 10i (patched)
+== step 11 (patched)
+== step 13 (patched)
+
+smb-rs spike: pin = git f4524d0; patched = pin + patches/ (30 changed lines).
+2026-11-17T23:50Z, Samba Version 4.23.8
+| step | item | endpoint | result | detail |
+|---|---|---|---|---|
+| 1 | [pin] login user/pass/domain + tree_connect + ls | fast rtt=0.09ms | OK | req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 QUERY_DIRECTORY:2 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1]  |
+| 1 | [pin] login time (connect+negotiate+session setup), median of 5 | fast rtt=0.09ms | OK | 2.8ms |
+| 1 | [pin] login user/pass/domain + tree_connect + ls | slow rtt=200.55ms | OK | req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 QUERY_DIRECTORY:2 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1]  |
+| 1 | [pin] login time (connect+negotiate+session setup), median of 5 | slow rtt=200.55ms | OK | 806.1ms |
+| 1 | [pin] wrong password refused | fast | OK | auth: Unexpected message status: Logon Failure (0xc000006d). |
+| 1 | [pin] guest (allow_unsigned_guest_access=true) | fast | ERROR | auth: Invalid state: SMB session setup succeeded before SSPI authentication completed. |
+| 1 | [pin] guest (crate default config) | fast | ERROR | auth: Unexpected Message, Message not signed or encrypted, but signing is required for the session! |
+| 1 | [pin] anonymous (empty user/password) | fast | ERROR | auth: Sspi error: InvalidToken: Got empty identity |
+| 1 | [pin] encrypted share (smb encrypt = required) | fast | OK | ls tree=6 entries; medium.bin 52432897 bytes sha_ok=true encrypted_frames=58 req=5 flights=41 interim=0 peak_out=8 conns=1 [ENCRYPTED:58 LOGOFF:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1] |
+| 1 | [pin] SOCKS5 no-auth :1080 | socks->fileserver.rsmb.test | OK | ls tree=6 entries; medium.bin 52432897 bytes sha_ok=true; proxy log lines 12->13; host resolves name: none |
+| 1 | [pin] SOCKS5 user/pass :1081 | socks->fileserver.rsmb.test | OK | ls tree=6 entries; medium.bin 52432897 bytes sha_ok=true; proxy log lines 13->14; host resolves name: none |
+| 1 | [patched] login user/pass/domain + tree_connect + ls | fast rtt=0.06ms | OK | req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 QUERY_DIRECTORY:2 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1]  |
+| 1 | [patched] login time (connect+negotiate+session setup), median of 5 | fast rtt=0.06ms | OK | 3.3ms |
+| 1 | [patched] login user/pass/domain + tree_connect + ls | slow rtt=200.15ms | OK | req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 QUERY_DIRECTORY:2 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1]  |
+| 1 | [patched] login time (connect+negotiate+session setup), median of 5 | slow rtt=200.15ms | OK | 806.2ms |
+| 1 | [patched] wrong password refused | fast | OK | auth: Unexpected message status: Logon Failure (0xc000006d). |
+| 1 | [patched] guest (allow_unsigned_guest_access=true) | fast | OK | read guest/hello.txt 12 bytes; tree_connect share refused=true |
+| 1 | [patched] guest (crate default config) | fast | ERROR | auth: Unexpected Message, Message not signed or encrypted, but signing is required for the session! |
+| 1 | [patched] anonymous (empty user/password) | fast | ERROR | auth: Sspi error: InvalidToken: Got empty identity |
+| 1 | [patched] encrypted share (smb encrypt = required) | fast | OK | ls tree=6 entries; medium.bin 52432897 bytes sha_ok=true encrypted_frames=58 req=5 flights=54 interim=0 peak_out=8 conns=1 [ENCRYPTED:58 LOGOFF:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1] |
+| 1 | [patched] SOCKS5 no-auth :1080 | socks->fileserver.rsmb.test | OK | ls tree=6 entries; medium.bin 52432897 bytes sha_ok=true; proxy log lines 14->15; host resolves name: none |
+| 1 | [patched] SOCKS5 user/pass :1081 | socks->fileserver.rsmb.test | OK | ls tree=6 entries; medium.bin 52432897 bytes sha_ok=true; proxy log lines 15->16; host resolves name: none |
+| 2 | [pin] share list, crate SrvSvc (NDR64) | fast rtt=0.05ms | ERROR | bind: Unexpected Message, BindAck result for syntax (71710533-beba-4937-8319-b5dbef9ccc36/1) was not acceptance: DcRpcCoPktBindAckResult { result: ProviderRejection, reason: ProposedTransferSyntaxesNotSupported, syntax: DceRpcSyntaxId { uuid: 00000000-0000-0000-0000-           0, version: 0 } } req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 READ:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1 WRITE:1] |
+| 2 | [pin] share list, crate SrvSvc (NDR64) | edge rtt=0.04ms | ERROR | bind: Unexpected Message, BindAck result for syntax (71710533-beba-4937-8319-b5dbef9ccc36/1) was not acceptance: DcRpcCoPktBindAckResult { result: ProviderRejection, reason: ProposedTransferSyntaxesNotSupported, syntax: DceRpcSyntaxId { uuid: 00000000-0000-0000-0000-           0, version: 0 } } req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 READ:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1 WRITE:1] |
+| 2 | [pin] share list, workaround: own NDR32 NetrShareEnum via FSCTL_PIPE_TRANSCEIVE, max output = max_transact | fast rtt=0.20ms | OK | 6 shares, 1 hidden, missing=[]; sample ["share=type=0x0\|", "readonly=type=0x0\|", "guest=type=0x0\|"]; req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 IOCTL:2 LOGOFF:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 2 | [pin] share list, workaround: own NDR32 NetrShareEnum via FSCTL_PIPE_TRANSCEIVE, max output = max_transact | edge rtt=0.05ms | ERROR | rpc response incomplete: 4280 bytes, no last fragment req=10 flights=10 interim=1 peak_out=1 conns=1 [CLOSE:1 CREATE:1 IOCTL:2 LOGOFF:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 2 | [pin] share list, same, max output 1 MiB (credit charge 17 > 16 credits the server grants) | edge rtt=0.06ms | TIMEOUT | TIMEOUT after 30s req=6 flights=6 interim=0 peak_out=1 conns=1 [CREATE:1 IOCTL:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1] |
+| 2 | [patched] share list, crate SrvSvc (NDR64) | fast rtt=0.04ms | ERROR | bind: Unexpected Message, BindAck result for syntax (71710533-beba-4937-8319-b5dbef9ccc36/1) was not acceptance: DcRpcCoPktBindAckResult { result: ProviderRejection, reason: ProposedTransferSyntaxesNotSupported, syntax: DceRpcSyntaxId { uuid: 00000000-0000-0000-0000-           0, version: 0 } } req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 READ:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1 WRITE:1] |
+| 2 | [patched] share list, crate SrvSvc (NDR64) | edge rtt=0.05ms | ERROR | bind: Unexpected Message, BindAck result for syntax (71710533-beba-4937-8319-b5dbef9ccc36/1) was not acceptance: DcRpcCoPktBindAckResult { result: ProviderRejection, reason: ProposedTransferSyntaxesNotSupported, syntax: DceRpcSyntaxId { uuid: 00000000-0000-0000-0000-           0, version: 0 } } req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 READ:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1 WRITE:1] |
+| 2 | [patched] share list, workaround: own NDR32 NetrShareEnum via FSCTL_PIPE_TRANSCEIVE, max output = max_transact | fast rtt=0.05ms | OK | 6 shares, 1 hidden, missing=[]; sample ["share=type=0x0\|", "readonly=type=0x0\|", "guest=type=0x0\|"]; req=10 flights=10 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 IOCTL:2 LOGOFF:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 2 | [patched] share list, workaround: own NDR32 NetrShareEnum via FSCTL_PIPE_TRANSCEIVE, max output = max_transact | edge rtt=0.03ms | OK | 306 shares, 31 hidden, missing=[]; sample ["share=type=0x0\|", "readonly=type=0x0\|", "guest=type=0x0\|"]; req=16 flights=16 interim=1 peak_out=1 conns=1 [CLOSE:1 CREATE:1 IOCTL:2 LOGOFF:1 NEGOTIATE:1 READ:6 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 2 | [patched] share list, same, max output 1 MiB (credit charge 17 > 16 credits the server grants) | edge rtt=0.05ms | TIMEOUT | TIMEOUT after 30s req=6 flights=6 interim=0 peak_out=1 conns=1 [CREATE:1 IOCTL:1 NEGOTIATE:1 SESSION_SETUP:2 TREE_CONNECT:1] |
+| 3 | [patched] dir check: READ_ATTRIBUTES\|SYNCHRONIZE +DIRECTORY_FILE | fast rtt=0.04ms | PASS | existing dir=dir, missing=NOT_FOUND, file=NOT_A_DIRECTORY, forbidden/ (0700 root)=ACCESS_DENIED, traverse-only/ (0711)=dir; worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] dir check: READ_ATTRIBUTES only +DIRECTORY_FILE | fast rtt=0.04ms | PASS | existing dir=dir, missing=NOT_FOUND, file=NOT_A_DIRECTORY, forbidden/ (0700 root)=dir, traverse-only/ (0711)=dir; worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] dir check: LIST_DIRECTORY\|READ_ATTRIBUTES\|SYNCHRONIZE +DIRECTORY_FILE | fast rtt=0.04ms | FAIL | existing dir=dir, missing=NOT_FOUND, file=NOT_A_DIRECTORY, forbidden/ (0700 root)=ACCESS_DENIED, traverse-only/ (0711)=ACCESS_DENIED(WRONG); worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] dir check: READ_ATTRIBUTES\|SYNCHRONIZE, no DIRECTORY_FILE | fast rtt=0.04ms | PASS | existing dir=dir, missing=NOT_FOUND, file=file, forbidden/ (0700 root)=ACCESS_DENIED, traverse-only/ (0711)=dir; worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] compound CREATE+CLOSE | fast rtt=0.04ms | N/A | crate has no compound-request API (OutgoingMessage carries one command); plain CREATE then CLOSE on drop instead |
+| 3 | [patched] dir check wall time (CREATE returns), median of 5 | fast rtt=0.05ms | OK | 0.9ms |
+| 3 | [patched] dir check: READ_ATTRIBUTES\|SYNCHRONIZE +DIRECTORY_FILE | slow rtt=200.47ms | PASS | existing dir=dir, missing=NOT_FOUND, file=NOT_A_DIRECTORY, forbidden/ (0700 root)=ACCESS_DENIED, traverse-only/ (0711)=dir; worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] dir check: READ_ATTRIBUTES only +DIRECTORY_FILE | slow rtt=200.47ms | PASS | existing dir=dir, missing=NOT_FOUND, file=NOT_A_DIRECTORY, forbidden/ (0700 root)=dir, traverse-only/ (0711)=dir; worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] dir check: LIST_DIRECTORY\|READ_ATTRIBUTES\|SYNCHRONIZE +DIRECTORY_FILE | slow rtt=200.47ms | FAIL | existing dir=dir, missing=NOT_FOUND, file=NOT_A_DIRECTORY, forbidden/ (0700 root)=ACCESS_DENIED, traverse-only/ (0711)=ACCESS_DENIED(WRONG); worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] dir check: READ_ATTRIBUTES\|SYNCHRONIZE, no DIRECTORY_FILE | slow rtt=200.47ms | PASS | existing dir=dir, missing=NOT_FOUND, file=file, forbidden/ (0700 root)=ACCESS_DENIED, traverse-only/ (0711)=dir; worst flights-at-return=1 worst requests-settled=2 |
+| 3 | [patched] compound CREATE+CLOSE | slow rtt=200.47ms | N/A | crate has no compound-request API (OutgoingMessage carries one command); plain CREATE then CLOSE on drop instead |
+| 3 | [patched] dir check wall time (CREATE returns), median of 5 | slow rtt=200.54ms | OK | 201.3ms |
+| 4 | [patched] ls tree/ = server listing (set of byte strings) | fast | OK | client 6 server 6 only-client 0 only-server 0 |
+| 4 | [patched] ls many/ = server listing (set of byte strings) | fast | OK | client 10000 server 10000 only-client 0 only-server 0 |
+| 4 | [patched] ls huge/ = server listing (set of byte strings) | fast | OK | client 100000 server 100000 only-client 0 only-server 0 |
+| 4 | [patched] ls longnames/ = server listing (set of byte strings) | fast | OK | client 2000 server 2000 only-client 0 only-server 0 |
+| 4 | [patched] first ls after connect: huge/ with 8388608-byte buffer | fast rtt=0.04ms | OK | 100000 entries; QUERY_DIRECTORY credit charges [128, 128, 128]; req=11 flights=11 interim=0 peak_out=1 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 QUERY_DIRECTORY:3 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 4 | [patched] ls tree/ buf=65536 | fast rtt=0.04ms | OK | 6 entries, 0.8ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls tree/ buf=8388608 | fast rtt=0.04ms | OK | 6 entries, 1.5ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls many/ buf=65536 | fast rtt=0.04ms | OK | 10000 entries, 76.5ms (median of 3), peak RSS +0.0MiB; req=16 flights=16 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:14] |
+| 4 | [patched] ls many/ buf=8388608 | fast rtt=0.04ms | OK | 10000 entries, 74.6ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls huge/ buf=65536 | fast rtt=0.04ms | OK | 100000 entries, 680.3ms (median of 3), peak RSS +0.0MiB; req=126 flights=126 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:124] |
+| 4 | [patched] ls huge/ buf=8388608 | fast rtt=0.04ms | OK | 100000 entries, 658.3ms (median of 3), peak RSS +13.6MiB; req=5 flights=5 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:3] |
+| 4 | [patched] ls longnames/ buf=65536 | fast rtt=0.04ms | OK | 2000 entries, 22.0ms (median of 3), peak RSS +0.0MiB; req=21 flights=21 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:19] |
+| 4 | [patched] ls longnames/ buf=8388608 | fast rtt=0.04ms | OK | 2000 entries, 22.1ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls tree/ buf=65536 | slow rtt=200.53ms | OK | 6 entries, 802.8ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls tree/ buf=8388608 | slow rtt=200.53ms | OK | 6 entries, 803.2ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls many/ buf=65536 | slow rtt=200.53ms | OK | 10000 entries, 3288.4ms (median of 3), peak RSS +0.0MiB; req=16 flights=16 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:14] |
+| 4 | [patched] ls many/ buf=8388608 | slow rtt=200.53ms | OK | 10000 entries, 879.3ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 4 | [patched] ls huge/ buf=65536 | slow rtt=200.53ms | OK | 100000 entries, 26452.2ms (median of 1), peak RSS +0.0MiB; req=126 flights=126 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:124] |
+| 4 | [patched] ls huge/ buf=8388608 | slow rtt=200.53ms | OK | 100000 entries, 1936.9ms (median of 3), peak RSS +16.4MiB; req=5 flights=5 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:3] |
+| 4 | [patched] ls longnames/ buf=65536 | slow rtt=200.53ms | OK | 2000 entries, 4239.7ms (median of 3), peak RSS +0.0MiB; req=21 flights=21 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:19] |
+| 4 | [patched] ls longnames/ buf=8388608 | slow rtt=200.53ms | OK | 2000 entries, 1027.5ms (median of 3), peak RSS +0.0MiB; req=4 flights=4 interim=0 peak_out=1 conns=0 [CLOSE:1 CREATE:1 QUERY_DIRECTORY:2] |
+| 5 | [pin] read every file in sizes/, sha256 vs server | fast rtt=0.03ms | OK | 11 files, chunk=1048576 width=16; failures [] |
+| 5 | [pin] download big.bin run 1 | fast rtt=0.03ms | TIMEOUT | TIMEOUT after 120s |
+| 5 | [pin] rest of step 5 | - | SKIPPED | after a failed or hung 1.1 GiB download (see issue #185 / patches/3-interim-credits.patch) |
+| 5 | [patched] read every file in sizes/, sha256 vs server | fast rtt=0.03ms | OK | 11 files, chunk=1048576 width=16; failures [] |
+| 5 | [patched] download big.bin run 1 | fast rtt=0.03ms | OK | 0.81s 1460MB/s sha_ok=true peak RSS +51.4MiB chunk=1048576 width=16 |
+| 5 | [patched] download big.bin run 2 | fast rtt=0.03ms | OK | 0.80s 1468MB/s sha_ok=true peak RSS +36.9MiB chunk=1048576 width=16 |
+| 5 | [patched] download big.bin run 3 | fast rtt=0.03ms | OK | 0.81s 1461MB/s sha_ok=true peak RSS +35.9MiB chunk=1048576 width=16 |
+| 5 | [patched] download big.bin run 4 | fast rtt=0.03ms | OK | 0.81s 1457MB/s sha_ok=true peak RSS +31.9MiB chunk=1048576 width=16 |
+| 5 | [patched] download big.bin run 5 | fast rtt=0.03ms | OK | 0.81s 1450MB/s sha_ok=true peak RSS +37.5MiB chunk=1048576 width=16 |
+| 5 | [patched] download big.bin x5: worst vs median | fast rtt=0.03ms | OK | median 0.81s worst 0.81s ratio 1.01 |
+| 5 | [patched] download big.bin through tap (evicted): interims | fast rtt=0.03ms | OK | sha_ok=true req=1135 flights=413 interim=864 peak_out=16 conns=1 [CLOSE:1 CREATE:1 LOGOFF:1 NEGOTIATE:1 READ:1127 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 5 | [patched] download big.bin at slow endpoint | slow rtt=200.52ms | OK | 59.9s 19.7MB/s; iperf3 -R ceiling 18.2MB/s (12 s incl. slow start); chunk=1048576 width=16 |
+| 5 | [patched] 1 MiB block of over4g.bin at offset 4 GiB+12345 | fast rtt=0.05ms | OK | Ok("d4d3564c37f80baea0aced2464d29f1b28743e71d53a4d14a1511321cfec1692") server d4d3564c37f80baea0aced2464d29f1b28743e71d53a4d14a1511321cfec1692 |
+| 6 | [patched] mkdir upload/spike-smbrs | fast | OK |  |
+| 6 | [patched] upload 1.1 GiB run 1 | fast rtt=0.04ms | OK | 1.06s 1111MB/s sha_match=true peak RSS +37.4MiB chunk=1048576 width=16 |
+| 6 | [patched] upload 1.1 GiB run 2 | fast rtt=0.04ms | OK | 0.99s 1188MB/s sha_match=true peak RSS +10.4MiB chunk=1048576 width=16 |
+| 6 | [patched] upload 1.1 GiB run 3 | fast rtt=0.04ms | OK | 1.00s 1176MB/s sha_match=true peak RSS +9.4MiB chunk=1048576 width=16 |
+| 6 | [patched] upload x3: worst vs median | fast rtt=0.04ms | OK | median 1.00s worst 1.06s |
+| 6 | [patched] rename a->c (target absent, no replace) | fast | OK |  |
+| 6 | [patched] rename c->b without replace (target exists): must fail | fast | OK | Err("Server returned an error message with status: Object Name Collision (0xc0000035).") |
+| 6 | [patched] rename c->b with replace | fast | OK | Ok(()); b.txt now 10 bytes (expect 10) |
+| 6 | [patched] delete file | fast | OK | Ok(()) gone |
+| 6 | [patched] mkdir + rmdir (delete-on-close on a directory) | fast | OK | Ok(()) Ok(()) |
+| 6 | [patched] cleanup upload/spike-smbrs | fast | OK |  |
+| 7 | [patched] walk tree/ width=16 (through tap) | slow rtt=200.36ms | OK | (341, 341, 1) (dirs, files, denied) 13862.4ms req=1365 flights=871 interim=0 peak_out=32 conns=0 [CLOSE:341 CREATE:342 QUERY_DIRECTORY:682] |
+| 7 | [patched] walk fanout/ width=16 (through tap) | slow rtt=200.36ms | OK | (2001, 2000, 0) (dirs, files, denied) 76329.4ms req=8006 flights=5120 interim=0 peak_out=32 conns=0 [CLOSE:2001 CREATE:2001 QUERY_DIRECTORY:4004] |
+| 7 | [patched] walk tree/ width=1 (through tap) | slow rtt=200.36ms | OK | (341, 341, 1) (dirs, files, denied) 205718.1ms req=1365 flights=1025 interim=0 peak_out=2 conns=0 [CLOSE:341 CREATE:342 QUERY_DIRECTORY:682] |
+| 7 | [patched] walk tree/ width=16 (timed, direct) | slow rtt=200.36ms | OK | (341, 341, 1) 13865.4ms |
+| 7 | [patched] walk fanout/ width=16 (timed, direct) | slow rtt=200.36ms | OK | (2001, 2000, 0) 76518.3ms |
+| 7 | [patched] walk tree/ width=1 (timed, direct) | slow rtt=200.36ms | OK | (341, 341, 1) 205681.8ms |
+| 7 | [patched] one TCP connection (server-side count, fanout+tree walk+read) | fast rtt=0.03ms | OK | server conns=1 fanout (2001, 2000, 0) tree (341, 341, 1) medium.bin 52432897 bytes |
+| 8 | [patched] samba-edge: 64 parallel listings + 50 MiB read at 64 KiB | edge rtt=0.03ms | OK | max_read=65536 max_write=65536 max_transact=65536; walk tree width 64 (341, 341, 1); walk fanout width 64 (2001, 2000, 0); medium.bin 52432897 bytes chunk=65536 width=64 sha_ok=true server conns=1 max credits granted in one response=16 req=10180 flights=8537 interim=0 peak_out=17 conns=1 [CLOSE:2343 CREATE:2344 LOGOFF:1 NEGOTIATE:1 QUERY_DIRECTORY:4686 READ:801 SESSION_SETUP:2 TREE_CONNECT:1 TREE_DISCONNECT:1] |
+| 9 | [patched] cjk/: list (bytes vs server) + open every file | fast | OK | listed 1010 server 1010 equal=true open failures 0: [] |
+| 9 | [patched] special/: list (bytes vs server) + open every file | fast | OK | listed 22 server 22 equal=true open failures 0: [] |
+| 9 | [patched] cjk/nested/: list (bytes vs server) + open every file | fast | OK | listed 1 server 1 equal=true open failures 0: [] |
+| 9 | [patched] open cjk/nested/<9 names>/leaf.txt by full path | fast | OK |  |
+| 9 | [patched] create dir + file for 14 non-ASCII names, bytes checked on server | fast | OK | server dirs equal=true files ok 14/14; failures [] |
+| 9 | [patched] mangled/: list + open every listed name | fast | OK | listed 9 (smbclient: 9), opened 5 (smbclient: 5), not opened ["LUI9XK~T.TXT:open mangled/LUI9XK~T.TXT: Server returned an error message with status: Object Name Invalid (0xc0000033).", "QLMSSD~7.TXT:open mangled/QLMSSD~7.TXT: Server returned an error message with status: Object Name Invalid (0xc0000033).", "S6XG2W~P.TXT:open mangled/S6XG2W~P.TXT: Server returned an error message with status: Object Name Invalid (0xc0000033).", "Q822F5~G.TXT:open mangled/Q822F5~G.TXT: Server returned an error message with status: Object Name Invalid (0xc0000033)."] |
+| 10 | [patched] tap cuts connection while idle; next ls | fast rtt=0.04ms | OK | error after 0.3ms: Some("open tree: Message processing failed. Failed to send message to worker!") |
+| 10 | [patched] tap cuts connection mid-download (big.bin, slow) | slow rtt=200.48ms | OK | error 602.0ms after the cut: Some("read @18874368: Client connection is stopped") |
+| 10 | [patched] blackhole on an open connection; next ls | slow:4450 rtt=200.50ms | OK | result after 10001.7ms: Some("open tree: Operation timed out: ReceiveNextMessage, took >10s") |
+| 10 | [patched] server paused (docker pause); next ls | fast | OK | result after 10001.6ms: Some("open tree: Operation timed out: ReceiveNextMessage, took >10s") |
+| 10 | [patched] new connection after unpause | fast | OK |  |
+| 10 | [patched] read dropped after 50 ms, then next read + ls on same connection | slow rtt=200.42ms | OK | dropped future completed=false; baseline 1 MiB read 1405.2ms; next read 351.1ms (Ok("ok")); ls 804.1ms (OK) |
+| 10 | [patched] idle 60s: requests sent unasked | fast | OK | requests=0 client_frames=0; ls after idle OK (crate has no echo/keepalive code: grep finds none) |
+| 11 | [patched] access denied: open forbidden/secret.txt | fast | INFO | ACCESS_DENIED(0xc0000022 via Error::ReceivedErrorMessage) |
+| 11 | [patched] access denied: open tree/unreadable.txt | fast | INFO | ACCESS_DENIED(0xc0000022 via Error::ReceivedErrorMessage) |
+| 11 | [patched] not found: open nope.txt | fast | INFO | NOT_FOUND(0xc0000034 via Error::ReceivedErrorMessage) |
+| 11 | [patched] path not found: open nodir/nope.txt | fast | INFO | PATH_NOT_FOUND(0xc000003a via Error::ReceivedErrorMessage) |
+| 11 | [patched] write to read-only share: create file | fast | INFO | ACCESS_DENIED(0xc0000022 via Error::ReceivedErrorMessage) |
+| 11 | [patched] disk full on tiny: write 12 MiB to a 10 MiB share | fast | INFO | Err("write @10485760: Server returned an error message with status: 0xc000007f.") (write errors are std::io::Error::other(string): status not matchable) |
+| 11 | [patched] cleanup tiny | fast | OK |  |
+| 12 | crates in Cargo.lock (spike: smb, smb-rpc, sspi, tokio, tokio-socks, futures, sha2, smbtap) | - | INFO | 315 |
+| 12 | crates in the dependency tree of smb alone (normal edges, incl. smb) | - | INFO | 209 |
+| 12 | clean release build of the spike (fresh target dir, sources already downloaded, 32 cores) | - | INFO | 15s |
+| 12 | git pin | - | INFO | smb + smb-rpc at upstream main f4524d0 = 0.12.1 + #183 (QueryDirectoryStream hang, 8+/4- lines), unreleased |
+| 12 | patch 1-guest-login.patch | - | INFO | 4 changed lines |
+| 12 | patch 2-pipe-read.patch | - | INFO | 18 changed lines |
+| 12 | patch 3-interim-credits.patch | - | INFO | 8 changed lines |
+| 12 | workaround code outside the crate | - | INFO | own NDR32 srvsvc NetrShareEnum (shares_ndr32 + helpers in src/main.rs, about 110 lines): the crate speaks NDR64 only, Samba refuses it |
+| 12 | NT-hash login | - | INFO | sspi 0.21.3: password "$NTLM$:<32 hex>" is taken as the NT hash (ntlm/messages/computations.rs); not tried |
+| 12 | Kerberos | - | INFO | smb cargo feature "kerberos" (adds reqwest), AuthMethodsConfig.kerberos; not tried |
+| 13 | [patched] smoke over wan-bad: login, ls tree, ls many, read 1 MiB+1 (request timeout 10 s) | wan-bad rtt=324.44ms | ERROR | read @0: Operation timed out: ReceiveNextMessage, took >10s |
+| 13 | [patched] smoke over wan-bad: login, ls tree, ls many, read 1 MiB+1 (request timeout 60 s) | wan-bad rtt=324.44ms | OK | login 1275.1ms ; ls tree (6 entries) at 3038.2ms; ls many (10000) at 6278.8ms; sizes/1048577.bin sha_ok=true at 8171.7ms (554 KB/s) |

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [".", "smbtap"]
+# Standalone spike projects with their own lock files and dependencies.
+exclude = ["spikes"]
+
+[package]
+name = "rsmb"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Fast SMB shell client"
+
+[dependencies]
+smb2 = "=0.43.0" # exact pin, docs/plans/master-plan.md 4.2
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "signal", "macros"] }
+async-trait = "0.1.92" # smb2's transport traits are defined with it
+tokio-socks = "0.5.3"
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+rustyline = { version = "19.0", default-features = false, features = ["with-file-history"] }
+serde_json = "1.0"
+rpassword = "7.5"
+libc = "0.2" # tcgetattr/tcsetattr: give the terminal back on SIGTERM in the shell
+
+[dev-dependencies]
+smbtap = { path = "smbtap" }

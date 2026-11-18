@@ -1,0 +1,19 @@
+[package]
+name = "spike-smb2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of the repository's workspace, own Cargo.lock.
+[workspace]
+
+[dependencies]
+smb2 = "=0.43.0"
+tokio = { version = "1", features = ["full"] }
+tokio-socks = "0.5"
+async-trait = "0.1"
+sha2 = "0.10"
+smbtap = { path = "../../smbtap" }
+
+[profile.release]
+debug = false

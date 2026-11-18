@@ -1,0 +1,12 @@
+endpoint command                          N connect_ms   ms_per_cmd  conns/cmd   reqs/cmd flights/cmd
+fast   cd /tree/d0                     10       0.02          4.1        2.0        6.0        6.0
+fast   ls small (tree/d0, 5 entries)   10       0.02          3.9        1.0        5.0        5.0
+fast   ls many/ (10,000 entries)       10       0.02        823.7        1.0       17.0       17.0
+fast   ls huge/ (100,000 entries)       1       0.02       8308.2        1.0      139.0      139.0
+slow   cd /tree/d0                     10     200.13       1608.8        2.0        6.0        6.0
+slow   ls small (tree/d0, 5 entries)   10     200.14       1207.8        1.0        5.0        5.0
+slow   ls many/ (10,000 entries)       10     200.18       4558.7        1.0       17.0       17.0
+slow   ls huge/ (100,000 entries)       1     200.10      37561.1        1.0      139.0      139.0
+
+smbclient-ng v3.1.0, Samba 4.23.8, 5 run(s) per row, 2026-11-18, 1067 s
+netem drops on wan during the run: 0

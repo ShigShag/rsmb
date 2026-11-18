@@ -1,0 +1,132 @@
+# The rsmb test environment. Start with ./testenv/up.sh; see docs/test-environment.md.
+name: rsmb
+
+networks:
+  pub:            # reachable from the host, which is 10.213.45.1
+    driver_opts:
+      com.docker.network.bridge.name: rsmb-pub
+    ipam:
+      config: [{ subnet: 10.213.45.0/24, gateway: 10.213.45.1 }]
+  back:           # wan routers -> samba; the host has no address and no route here
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: rsmb-back
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 10.213.46.0/24 }]
+  priv:           # socks -> samba-private; the host has no address and no route here
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: rsmb-priv
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config: [{ subnet: 10.213.47.0/24 }]
+
+x-samba: &samba
+  image: rsmb-samba
+  init: true
+  pull_policy: never            # built locally by the samba service
+  cap_add: [NET_ADMIN]          # iptables rule that counts incoming connections
+  volumes:
+    - type: tmpfs               # the "tiny" share: 10 MiB, for disk-full tests
+      target: /srv/tiny
+      tmpfs: { size: 10485760, mode: 01777 }
+  healthcheck:
+    # Over loopback, so the healthcheck never shows up in the connection count.
+    test: ["CMD-SHELL", "smbclient -N -L //127.0.0.1 >/dev/null 2>&1"]
+    interval: 2s
+    timeout: 5s
+    retries: 2
+    start_period: 60s
+    start_interval: 1s
+
+x-wan: &wan
+  image: rsmb-wan
+  pull_policy: never            # built locally by the wan service
+  init: true
+  cap_add: [NET_ADMIN]
+  sysctls:
+    net.ipv4.ip_forward: 1
+  healthcheck:
+    test: ["CMD", "sh", "/usr/local/bin/router.sh", "health"]
+    interval: 2s
+    timeout: 5s
+    retries: 2
+    start_period: 60s
+    start_interval: 1s
+  depends_on:
+    samba: { condition: service_healthy }
+
+services:
+  samba:
+    <<: *samba
+    build:
+      context: samba
+      args: { XL: "${RSMB_XL:-0}" }
+    container_name: rsmb-samba
+    environment: { ROLE: main }
+    networks:
+      pub: { ipv4_address: 10.213.45.10 }
+      back: { ipv4_address: 10.213.46.10 }
+
+  samba-edge:
+    <<: *samba
+    container_name: rsmb-samba-edge
+    environment: { ROLE: edge }
+    networks:
+      pub: { ipv4_address: 10.213.45.11 }
+
+  samba-private:
+    <<: *samba
+    container_name: rsmb-samba-private
+    environment: { ROLE: private }
+    networks:
+      priv:
+        ipv4_address: 10.213.47.10
+        aliases: [fileserver.rsmb.test]
+
+  wan:
+    <<: *wan
+    build: wan
+    container_name: rsmb-wan
+    environment:
+      PUB_ADDR: 10.213.45.30
+      BACK_ADDR: 10.213.46.30
+      TARGET: 10.213.46.10
+      NETEM: delay 100ms
+    networks:
+      pub: { ipv4_address: 10.213.45.30 }
+      back: { ipv4_address: 10.213.46.30 }
+
+  wan-bad:
+    <<: *wan
+    container_name: rsmb-wan-bad
+    environment:
+      PUB_ADDR: 10.213.45.31
+      BACK_ADDR: 10.213.46.31
+      TARGET: 10.213.46.10
+      NETEM: delay 150ms 40ms loss 1% rate 20mbit
+    depends_on:
+      samba: { condition: service_healthy }
+    networks:
+      pub: { ipv4_address: 10.213.45.31 }
+      back: { ipv4_address: 10.213.46.31 }
+
+  socks:
+    build: socks
+    image: rsmb-socks
+    container_name: rsmb-socks
+    init: true
+    healthcheck:
+      # Both listeners in LISTEN state (1080 = 0x0438, 1081 = 0x0439), without connecting.
+      test: ["CMD-SHELL", "grep -q ':0438 00000000:0000 0A' /proc/net/tcp && grep -q ':0439 00000000:0000 0A' /proc/net/tcp"]
+      interval: 2s
+      timeout: 5s
+      retries: 2
+      start_period: 60s
+      start_interval: 1s
+    depends_on:
+      samba-private: { condition: service_healthy }
+    networks:
+      pub: { ipv4_address: 10.213.45.20 }
+      priv: { ipv4_address: 10.213.47.20 }

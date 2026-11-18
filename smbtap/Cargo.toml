@@ -1,0 +1,8 @@
+[package]
+name = "smbtap"
+version = "0.1.0"
+edition = "2024"
+description = "TCP forwarder that counts SMB2 requests, responses and round trips"
+publish = false
+
+[dependencies]

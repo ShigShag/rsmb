@@ -1,0 +1,30 @@
+[package]
+name = "spike-smbrs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of the repository workspace, own Cargo.lock.
+[workspace]
+exclude = ["target"]  # the patched upstream checkout lives in target/smb-rs-src
+
+[dependencies]
+# Git pin: upstream main f4524d0 = release 0.12.1 + one commit, "fix: prevent QueryDirectoryStream
+# hang and task leak" (#183, issue #182; 8+/4- lines). With crates.io 0.12.1 a listing whose first
+# reply holds more than 1024 entries hangs forever (measured: many/ with an 8 MiB buffer).
+smb = { git = "https://github.com/afiffon/smb-rs", rev = "f4524d032c8951cc288e1c8231ad68588583abda" }
+smb-rpc = { git = "https://github.com/afiffon/smb-rs", rev = "f4524d032c8951cc288e1c8231ad68588583abda" }
+# Not re-exported by `smb`; needed for the identity type. Pinned to exactly what smb pins.
+sspi = { version = "=0.21.3", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["full"] }
+tokio-socks = "0.5"
+futures = "0.3"
+sha2 = "0.10"
+smbtap = { path = "../../smbtap" }
+
+[features]
+# Passed as `--features patched` by run.sh, which builds against a patched upstream checkout (patches/).
+patched = []
+
+[profile.release]
+debug = false
