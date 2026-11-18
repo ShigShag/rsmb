@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Checks that the running test environment is what the tests assume, using only tools that do not
 # depend on this project's code: the host's smbclient, bash /dev/tcp, python3 (SOCKS5), iperf3,
-# docker exec. Prints one line per check; exits non-zero if any check fails.
-# See docs/test-environment.md for what each check protects.
+# docker exec (kinit, kvno and smbclient inside the DC). Prints one line per check; exits non-zero
+# if any check fails. See docs/test-environment.md for what each check protects.
 set -uo pipefail
 cd "$(dirname "$0")"
+# The host's smbclient tries Kerberos by default and would read the host's /etc/krb5.conf, which
+# may describe another realm: nothing here may depend on it.
+export KRB5_CONFIG=/dev/null
 # Exclusive for the whole run: it resets connection counters and turns the blackhole on and off.
 # Waits while a spike or benchmark holds the shared lock (docs/test-environment.md, "The lock").
 exec 9>>/tmp/rsmb-env.lock
@@ -12,7 +15,7 @@ flock -x -w 1800 9 || { echo "$(basename "$0"): could not take /tmp/rsmb-env.loc
 . samba/names.sh
 
 FAST=10.213.45.10 SLOW=10.213.45.30 BAD=10.213.45.31 EDGE=10.213.45.11 PROXY=10.213.45.20
-PRIVATE_IP=10.213.47.10 PRIVATE_NAME=fileserver.rsmb.test
+PRIVATE_IP=10.213.47.10 PRIVATE_NAME=fileserver.rsmb.test DC=10.213.45.12
 CRED='TESTDOM\tester%testpass'
 fails=0
 
@@ -77,11 +80,11 @@ EOF
 py() { python3 -c "$PY" "$@"; }
 
 # --- services ---
-for c in samba samba-edge samba-private wan wan-bad socks; do
+for c in samba samba-edge samba-private wan wan-bad socks samba-dc; do
     st=$(docker inspect -f '{{.State.Health.Status}}' "rsmb-$c" 2>/dev/null || echo missing)
     [ "$st" = healthy ] || { fail "rsmb-$c is $st (logs: docker logs rsmb-$c; restart: testenv/down.sh && testenv/up.sh)"; exit 1; }
 done
-ok "all six containers healthy"
+ok "all seven containers healthy"
 ok "Samba version: $(docker exec rsmb-samba smbd -V)"
 
 # --- latency: TCP connect time, median of 5 after one warm-up connect ---
@@ -169,6 +172,27 @@ check "SOCKS5 1081 without credentials refused" test "$(py socks $PROXY 1081 $PR
 after=$(docker logs rsmb-socks 2>&1 | grep -c "connected to $PRIVATE_NAME:445")
 check "proxy log shows 'connected to $PRIVATE_NAME:445' for both" test $((after - before)) = 2
 n=$(./ctl.sh conns samba-private); check "samba-private counted $n connections (2)" test "$n" = 2
+
+# --- Kerberos and the DC ---
+# Inside the DC: its own kinit, kvno and smbclient, with a cache of their own.
+kdc_lines() { local l; l=$(docker logs rsmb-samba-dc 2>&1); grep -c 'TGS-REQ tester@RSMB.TEST from ipv4:' <<<"$l"; }
+out=$(docker exec rsmb-samba-dc sh -c 'c=$(mktemp -u); trap "rm -f $c" EXIT; echo testpass | kinit -c "FILE:$c" tester@RSMB.TEST >/dev/null && KRB5CCNAME="FILE:$c" smbclient -s /dev/null //dc.rsmb.test/share --use-kerberos=required -c "get hello.txt /dev/stdout" 2>/dev/null')
+check "a Kerberos login in the DC (kinit, smbclient --use-kerberos=required) reads the share" test "$out" = "kerberos works"
+before=$(kdc_lines)
+docker exec rsmb-samba-dc sh -c 'c=$(mktemp -u); trap "rm -f $c" EXIT; echo testpass | kinit -c "FILE:$c" tester@RSMB.TEST >/dev/null && kvno -q -c "FILE:$c" cifs/10.213.45.12 cifs/127.0.0.1 cifs/10.213.45.10 cifs/dc.rsmb.test'
+check "the four SPNs exist (kvno cifs/10.213.45.12 cifs/127.0.0.1 cifs/10.213.45.10 cifs/dc.rsmb.test)" test $? = 0
+after=$(kdc_lines)
+check "the KDC's log names the source of each request ($((after - before)) new 'TGS-REQ tester@RSMB.TEST from ipv4:' lines, at least 4)" test $((after - before)) -ge 4
+docker exec rsmb-samba-dc sh -c 'c=$(mktemp -u); trap "rm -f $c" EXIT; echo testpass | kinit -c "FILE:$c" tester@RSMB.TEST >/dev/null && kvno -q -c "FILE:$c" cifs/nosuch.rsmb.test' 2>/dev/null
+check "an unknown SPN (cifs/nosuch.rsmb.test) is refused" test $? != 0
+cc=$(docker exec rsmb-samba-dc mkcache -f tester cifs/dc.rsmb.test | od -A n -t x1 -v | tr -d ' \n')
+check "mkcache writes a ticket cache ($(( ${#cc} / 2 )) bytes, at least 1000, starting 05 04)" test "${cc:0:4}" = 0504 -a "${#cc}" -ge 2000
+for n in dc.rsmb.test rsmb.test; do
+    getent hosts $n >/dev/null; check "$n does not resolve on the host" test $? != 0
+    check "the proxy (1080) resolves $n and reaches SMB on the DC" test "$(py socks $PROXY 1080 $n)" = smb2
+done
+timeout 3 bash -c "exec 3<>/dev/tcp/$DC/88" 2>/dev/null; check "the KDC $DC:88 is reachable from the host without the proxy" test $? = 0
+check "a password login at the DC with a wrong password is refused" says NT_STATUS_LOGON_FAILURE $DC share --use-kerberos=off -U 'RSMB\tester%wrong' -c ls
 
 # --- samba-edge ---
 n=$(smbclient -s /dev/null -L //$EDGE -U "$CRED" 2>&1 | grep -cE '^\s+edge[0-9]{3}\$?\s+Disk')

@@ -1179,3 +1179,76 @@ fn ctrl_c_through_the_proxy() {
     p.send(b"pwd\r");
     p.expect("//fileserver.rsmb.test/share/\r\n", WAIT);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stage 5: Kerberos (docs/plans/stage-5.md 7.4)
+
+/// One-shot `-k` run: `args`, KRB5CCNAME=`cache`, KRB5_CONFIG=`conf`, `--json`.
+fn run_k(args: &[&str], cache: &Path, conf: &str) -> Output {
+    let mut a = args.to_vec();
+    a.extend(["-k", "-N", "--json", "-C", "use share", "-C", "ls /"]);
+    run_env(
+        &a,
+        None,
+        &[
+            ("KRB5CCNAME", cache.to_str().unwrap()),
+            ("KRB5_CONFIG", conf),
+        ],
+    )
+}
+
+/// X71: a KDC that accepts the connection and says nothing: one 10 s limit for the exchange,
+/// kind connect, the message names the KDC; after the unpause a login works.
+#[test]
+fn silent_kdc() {
+    let _s = serial();
+    let dir = tmp("silent_kdc");
+    let conf = krb5_conf(&dir, DC);
+    let conf = conf.to_str().unwrap();
+    let tgt = krb_cache(&dir, "tgt.cc", "-f", "tester", &[]);
+    let guard = Guard(vec!["unpause", "samba-dc"]);
+    ctl(&["pause", "samba-dc"]);
+    let o = run_k(&["-H", "10.213.45.10"], &tgt, conf);
+    println!(
+        "a TGT-only login with a paused KDC failed after {:?}",
+        o.took
+    );
+    assert_eq!(o.code, 3, "{}", o.stdout);
+    assert!(
+        o.took >= Duration::from_secs(9) && o.took <= Duration::from_secs(13),
+        "expected the 10 s of the exchange, took {:?}",
+        o.took
+    );
+    let v = o.json();
+    assert_eq!(v.len(), 1, "{}", o.stdout);
+    assert_eq!(v[0]["kind"], "connect", "{}", o.stdout);
+    let m = v[0]["message"].as_str().unwrap();
+    for w in [
+        "KDC 10.213.45.12:88",
+        "connected to the KDC, but it did not answer within 10 s",
+    ] {
+        assert!(m.contains(w), "{w:?} not in {m:?}");
+    }
+    drop(guard);
+    let o = run_k(&["-H", DC], &tgt, conf);
+    assert_eq!(o.code, 0, "after the unpause: {}", o.stdout);
+}
+
+/// X72: through the proxy, by name: a TGT-only login is one connection to the KDC (the realm's
+/// name) and one to the server; with the service ticket only the server's.
+#[test]
+fn kerberos_connections_through_the_proxy() {
+    let _s = serial();
+    let dir = tmp("kerberos_connections_through_the_proxy");
+    let tgt = krb_cache(&dir, "tgt.cc", "-f", "tester", &[]);
+    let svc = krb_cache(&dir, "svc.cc", "-f", "tester", &["cifs/dc.rsmb.test"]);
+    let (kdc, server) = ("connected to rsmb.test:88", "connected to dc.rsmb.test:445");
+    let args = ["--proxy", "socks5://10.213.45.20:1080", "-H", DC_NAME];
+    for (cache, kdc_more) in [(&tgt, 1), (&svc, 0)] {
+        let (k0, s0) = (proxy_lines(kdc), proxy_lines(server));
+        let o = run_k(&args, cache, "/dev/null");
+        assert_eq!(o.code, 0, "{}", o.stdout);
+        expect_proxy_lines(server, s0 + 1, &format!("{}: the server", cache.display()));
+        expect_proxy_lines(kdc, k0 + kdc_more, &format!("{}: the KDC", cache.display()));
+    }
+}

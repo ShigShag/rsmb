@@ -190,3 +190,37 @@ Every requirement is met; the test that proves each is named (each name was chec
 - A raw ESC from a real server (the escaping is tested with the C1 and bidi names Samba accepts).
 - Proxies other than microsocks.
 - The 500,000-entry memory figures.
+
+## Stage 5 (2026-11-18)
+
+The review of Kerberos login from a ticket cache (`-k`), direct and through `--proxy`, with the
+loopback KDC relay. The reviewer reproduced findings 1, 2 and 3; the orchestrator reproduced
+finding 4 and confirmed 1 and 5 in the code. Each behaviour finding was fixed with a test that
+failed without the fix (how each was checked is in the last column).
+
+| # | Severity | Finding | How validated | What was done | Guarding test |
+|---|---|---|---|---|---|
+| 1 | medium | `known-limitations.md` and `architecture.md` said the only socket of a TGT-only login is the relay's on 127.0.0.1. The crate's own UDP socket for the KDC binds `0.0.0.0:0` and takes the first datagram from any sender; and the relay forwarded a datagram from any local sender to the KDC (through the user's proxy, with its credentials) and sent the answer back to that sender | The reviewer sent one datagram `30 00` from another host to that port during a TGT-only login: the login ended after 1566 ms, exit 3, kind `auth`, `the ticket in the cache or the KDC's answer could not be used (Invalid data: … got 0x30)`. The crate: `smb2-0.43.0/src/auth/kerberos/kdc.rs:91`, `UdpSocket::bind(0.0.0.0:0)`. The relay: read | The two documents (and the `smb2` list of `known-limitations.md`, `stage-5.md` K12 and V10) now say it: during a login with only a TGT the crate's socket listens on every interface on an ephemeral port, a stray or forged datagram can end that login with an `auth` error, it cannot make a login succeed (an answer is only of use if it decrypts with the key from the cache), rsmb cannot change it, a service ticket in the cache opens none. `kdc_relay` serves only the first sender it hears from and ignores every other address | `kdc_relay_serves_the_first_sender_only` fails with the check taken out (`the stranger got an answer`); `kdc_relay_carries_the_exchange` now sends from one socket, as the crate does |
+| 2 | medium | A `KRB5CCNAME` that is set but not UTF-8 was taken as unset (`std::env::var(..).ok()`), the default `/tmp/krb5cc_<uid>` was read, and the message said the variable was not set; the same for `KRB5_CONFIG` (then `/etc/krb5.conf`) | The reviewer's run: a valid cache whose file name has byte `\xe9` gave exit 3, `ticket cache /tmp/krb5cc_1000: No such file or directory … (KRB5CCNAME is not set, so the default file … was used …)`. The code at `session.rs` 677 and 1042 | `var_os`; `ccache_path` and `krb5_files` take `&OsStr` and work on the bytes (the `FILE:` prefix, the refusal of `DIR:`, `KCM:`, `KEYRING:` and other types, the `:` split are unchanged); `commands.md` says it | `kerberos_cache_odd_files` (a cache at a non-UTF-8 path logs in: failed first with the reviewer's message), `ccache_paths` and `kdc_files` (the non-UTF-8 cases) |
+| 3 | medium | The end of a ticket was described wrongly in `help all`, `scripting.md` and `known-limitations.md` ("the next command fails with `connection_lost`, and the one after it logs in again"); `commands.md` and `architecture.md` were right | The reviewer's three runs with 130 s tickets, each command 150 s after they were made: a fresh cache in place, `ls /`: ok, no error (a reading command is run again after the reconnect); the old cache kept, `ls /`: `auth`, `reconnect failed: Kerberos: the ticket for cifs/… expired at …; run kinit`; a fresh cache, `mkdir`: `connection_lost`, `'mkdir …' was not run again` | The three texts say that: a reading command is run again on a new login that reads the cache again (it works with new tickets, with the old ones it is `auth`), a command that changes something fails with `connection_lost` and is not run again, and the next command logs in again | `help_all_has_everything` checks the new words and that the old sentence is gone |
+| 4 | low | A ticket cache that is not a regular file hung rsmb at start-up and SIGINT and SIGTERM did not end it: the synchronous `open` of a FIFO blocks inside the future `interruptible` drives, so its signal branch is never polled. The same for the `KRB5_CONFIG` files read in `kdc_for` | Reproduced by the orchestrator: `mkfifo -m 600 fifo; KRB5_CONFIG=/dev/null KRB5CCNAME=$PWD/fifo timeout -s INT -k 3 2 rsmb -k -H 127.0.0.1 -P 1 --json -N -C pwd` gave `Killed`, exit 137 after 5001 ms (the `kdc_for` case from reading the code) | `open_regular`: the file is opened with `O_NONBLOCK` (a FIFO does not wait for a writer) and refused unless `fstat` of the opened file says regular, so nothing is read and there is no window between a check and the open. The cache: `auth`, `Kerberos: ticket cache <path>: not a regular file`; a `KRB5_CONFIG` file that is not regular counts as one that cannot be read (absent). Now exit 3 after 2 ms | `non_regular_files_are_not_read` (unit, on a thread with a 5 s bound; fails with the flag removed), `kerberos_cache_odd_files` (a FIFO and a directory: `auth`, `not a regular file`, within 5 s; without the fix the run ended only at the harness's 60 s limit) |
+| 5 | low (test) | S71 counted the KDC's whole log, not new lines: `assert_eq!(kdc_requests("kproxy", "10.213.45.1"), 0)`; one direct `kproxy` request at any time made it fail until the container was recreated | The code | The count is taken before and asserted not to have grown (three places) | `kerberos_kdc_is_asked_through_the_proxy` |
+
+### Changed at the user's request during the review: the help
+
+`--help` printed one line of up to 286 characters per flag and the text manual had one line of 2608
+characters. Now the doc comment of each flag in `Args` (`src/main.rs`) has a first paragraph, which
+is the short `--help` line (within 80 columns), and a second paragraph with the details that only
+the manual shows; `wrap` and `Out::doc` (`src/commands.rs`) wrap the text manual to 80 columns.
+`--json` is unchanged (the manual's objects keep their text whole). Tests: `manual_fits_80_columns`
+(no line of the text manual is longer than 80 columns unless it is one word, `--json` is not
+wrapped, and `wrap` keeps the words and the hanging indent) and the extended `args_are_sound`
+(`--help` is within 80 columns and does not carry the details, and every flag is in the manual).
+The tests that look for a phrase in the manual compare with whitespace squashed
+(`commands::tests::squash`).
+
+### Checked and found correct
+
+- The relay still serves the crate's own exchange: the crate binds one socket per KDC call and
+  makes one call for a TGT-only login (`tgs_exchange`; `authenticator.rs`), retrying on the same
+  socket, so "the first sender" is the crate's socket.

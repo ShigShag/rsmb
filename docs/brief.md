@@ -83,7 +83,7 @@ Finish and verify each stage before starting the next. Commit locally at the end
 - A `--proxy socks5://[user:pass@]host:port` option. All traffic to the server goes through the proxy, including name resolution when a hostname is given.
 - Everything from Stages 1 to 3 works through the proxy.
 
-**Not in scope unless I ask later:** Kerberos, ACL display, the module system, multiple simultaneous sessions, mount, the remaining smbclient-ng commands.
+**Not in scope unless I ask later:** ACL display, the module system, multiple simultaneous sessions, mount, the remaining smbclient-ng commands.
 
 ### Test environment
 
@@ -123,3 +123,10 @@ Speed targets, measured in the integration tests:
 6. **`help all`.** A command that prints every command with examples, so an AI that does not know the program can learn how to use it. `AGENTS.md` states that this is kept up for every new feature.
 7. **Automated testing.** Local only. Run after each major feature addition unless the user instructs otherwise; this rule is written down in `AGENTS.md`.
 8. **Process.** This replaces "How to run the work" above. The main session only orchestrates. One master plan describes the four stages. Per stage: a separate Fable agent writes the stage plan; one Opus adversary agent attacks that plan; one Opus agent implements it; one Opus agent reviews the result; each finding is validated as true before anything is fixed; one Sonnet agent fixes the confirmed findings; then commit. One agent per task, not several agents in parallel on the same task.
+9. **Stage 5: Kerberos** (2026-11-18). Kerberos login with a ticket is a required feature. It takes
+   `-k` (`--kerberos`), which uses the ticket cache (`KRB5CCNAME`). Only the ticket cache: no
+   password-based Kerberos, no flag for the KDC host, no certificate login. Through `--proxy` it
+   must work too, including the exchange with the KDC (as smbclient-ng does under proxychains);
+   nothing goes around the proxy. `--keep-going` keeps only its long form. Work stays in this
+   repository; each stage is pushed to `origin` and also to the public repository
+   `ShigShag/rsmb`. Commit messages carry no AI attribution (no `Co-Authored-By`, no session link).

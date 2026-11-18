@@ -1,7 +1,7 @@
 # Test environment
 
-Six containers in the Docker Compose project `rsmb`: three Samba servers, two latency routers and a
-SOCKS5 proxy. Nothing needs root on the host and nothing changes the host outside this project's
+Seven containers in the Docker Compose project `rsmb`: three Samba servers, two latency routers, a
+SOCKS5 proxy and a Samba Active Directory domain controller with its own KDC (Kerberos). Nothing needs root on the host and nothing changes the host outside this project's
 containers, networks and images. Built from `testenv/`.
 
 ```
@@ -27,6 +27,7 @@ and `tshark` usable without root (membership in the `wireshark` group).
 | `samba-edge` | `rsmb-samba-edge` | 10.213.45.11:445 | stingy server: 16 credits, 64 KiB I/O, 300 extra shares, multichannel on |
 | `socks` | `rsmb-socks` | 10.213.45.20:1080 / :1081 | microsocks 1.0.5: no auth / `tester`:`testpass`. Also 10.213.47.20 on `priv` |
 | `samba-private` | `rsmb-samba-private` | `fileserver.rsmb.test` = 10.213.47.10 | reachable only through `socks` |
+| `samba-dc` | `rsmb-samba-dc` | 10.213.45.12:445 and :88, aliases `dc.rsmb.test` and `rsmb.test` | the Kerberos server: Samba AD DC, realm `RSMB.TEST`, its own KDC on port 88. The host reaches it directly by address; only the proxy resolves the two names |
 
 Networks, with fixed bridge names so a capture interface is stable:
 
@@ -155,6 +156,71 @@ SOCKS5 mode forwards each message in one write, `docs/measuring.md`), and it doe
 segment one round trip later (Nagle's algorithm; `docs/performance.md`, "Through a SOCKS5
 proxy").
 
+## The Kerberos server: `samba-dc`
+
+Image `rsmb-samba-dc` (`testenv/samba-dc/`: `Dockerfile`, `smb.conf`, `krb5.conf`, `mkcache`):
+Alpine 3.24.4, `samba-dc` (Samba 4.23.8 with its own Heimdal KDC), `samba-client`, and MIT `krb5`
+(1.22.3: `kinit`, `kvno`, `klist`) to make ticket caches inside the container. The domain is
+provisioned **at image build**: `samba-tool domain provision --realm=RSMB.TEST --domain=RSMB
+--server-role=dc --dns-backend=SAMBA_INTERNAL --host-name=dc --host-ip=10.213.45.12`, with
+`--option='vfs objects = dfs_samba4 acl_xattr xattr_tdb'`. Without `xattr_tdb` provisioning fails
+in a build container at `setsysvolacl`: the NT ACLs need the `security.NTACL` extended attribute,
+which a build may not set; `xattr_tdb` keeps them in a file. Provisioning writes its own
+`smb.conf` (with a `dns forwarder` taken from the building host's `resolv.conf`); the image
+replaces it with its own. The realm's keys are made at build and are in the image only, in no
+file of the repository; the container's hostname does not matter (`netbios name = DC` is in
+`smb.conf`), and a cache made before `docker restart` still logs in after it.
+
+`smb.conf`: `server role = active directory domain controller`, `realm = RSMB.TEST`, `workgroup
+= RSMB`, NetBIOS off, port 445 only, no printers, `server multi channel support = no` (a tap must
+see everything), and **`log level = 1 kerberos:3`**: at `kerberos:3` the KDC writes one line per
+request that names the client, the **source address** and the service, for example
+`Kerberos: TGS-REQ tester@RSMB.TEST from ipv4:10.213.45.20:44566 for cifs/dc.rsmb.test@RSMB.TEST
+[renewable-ok, canonicalize, renewable, forwardable]` (at `kerberos:2` or lower nothing). In 14
+runs while planning, the number of such lines equalled packet counters on port 88, so a line count
+is a request count (one exception: a request with a TGT expired for more than five minutes was
+answered without such a line). The tests read the lines with `docker logs rsmb-samba-dc`.
+`krb5.conf` is for `kinit` and `kvno` inside the container only (`kdc = 127.0.0.1`, no DNS).
+
+What is in the realm, and why:
+
+| Thing | For |
+|---|---|
+| user `tester` / `testpass` | every ordinary Kerberos test |
+| users `kdirect`, `kproxy` / `testpass` | `kerberos_kdc_is_asked_through_the_proxy` only: lines of the KDC's log that name them belong to that test, whatever else runs |
+| user `kother` / `testpass` | `kerberos_reconnect_reads_the_cache_again` only: the cache of another principal put in a session's place |
+| SPN `cifs/dc.rsmb.test` | nothing to add: the machine account has `HOST/dc.rsmb.test` and the KDC maps `cifs` to it |
+| SPN `cifs/10.213.45.12` | `-H` by address |
+| SPN `cifs/127.0.0.1` | a tap in front of the DC (the tap is reached as 127.0.0.1) |
+| SPN `cifs/10.213.45.10` | a valid ticket for `samba`, which does no Kerberos: the server's refusal of a ticket |
+| share `share` (`/srv/share`): `hello.txt` (`kerberos works` and a newline), `sub/1m.bin` (1,048,577 bytes: the numbers from `seq 1 200000`), `upload/` (mode 1777) | a listing, a read with a checksum, a write. Files written over SMB belong to the id Samba maps the realm's user to, so a test's scratch directory is made with mode 1777, not owned by a Unix user |
+| share `encrypted` (the same path, `smb encrypt = required`) | encryption with a Kerberos session key |
+| the admin password `Adm1n-testpass` | a throwaway value inside a local image |
+
+`mkcache -f|-F <user> [<spn>…]` (in the image, `/usr/local/bin/mkcache`) runs `kinit` for
+`<user>@RSMB.TEST` (password `testpass`) into a temporary file cache with a ticket-granting
+ticket that is forwardable (`-f`) or not (`-F`), then `kvno` for each SPN, and writes the cache
+file's bytes to stdout. The tests make every cache this way (`docker exec rsmb-samba-dc mkcache
+…`, 0.1 s); nothing on the host's Kerberos is used. Two facts of this KDC that the tests design
+around: it refuses every TGS request with a ticket of two minutes or less (Samba takes it for a
+password-change ticket; `kinit -l 121s` is the shortest lifetime that yields a service ticket), so
+an expired ticket is made by rewriting a copy of a cache, not by waiting; and a server accepts a
+ticket for five minutes after its end (clock allowance). It answers a TGS request over UDP with
+`KRB5KRB_ERR_RESPONSE_TOO_BIG` (the reply is about 1,500 bytes), so a client that starts with UDP
+pays one round trip for nothing here.
+
+No capability, no volume, no connection counter (`ctl.sh conns` and `evict` do not apply): the
+tests count connections in their taps and KDC requests in the KDC's log. The healthcheck looks for
+ports 445 and 88 in LISTEN state in `/proc/net/tcp`, without connecting. Ports listen 0.3 s after
+`docker restart`; healthy about 1.3 s after `docker run`. Image 219 MB; build from nothing 84.7 s
+on this machine (95 packages, provisioning, users, SPNs), seconds with the layers cached.
+
+The proxy is on `pub` too, so it reaches the DC by address and resolves both aliases:
+`dc.rsmb.test` is the DC's name in the realm, `rsmb.test` is the realm's own name, where rsmb
+looks for the KDC when no `krb5.conf` names one (as a domain's name resolves to its domain
+controllers). The host resolves neither, but reaches 10.213.45.12 on ports 445 and 88 directly:
+that is what makes "nothing went around the proxy" a claim that could fail.
+
 ## Fixtures: built to hurt
 
 Created at image build: `testenv/samba/large-files.sh` (own image layer, so editing other fixtures
@@ -264,7 +330,7 @@ server (`ctl.sh pause samba`: TCP is accepted by the kernel, nothing answers), a
 a connection at any moment (see `docs/measuring.md`).
 
 Image: 5.96 GB, of which 5.5 GiB are the large files. On this machine: build and start from
-nothing 68 s; a rebuild from the fixtures layer on (the large files are a layer of their own and
+nothing 68 s (Stages 1 to 4; with the DC's 84.7 s about 150 s); a rebuild from the fixtures layer on (the large files are a layer of their own and
 stay) 36.4 s, then `down.sh` and `up.sh` 6 s (Stage 3, for `links/`); `down.sh` 0.8 s; `up.sh` with the images built 4.6–4.7 s; `up.sh` when already running
 about 1 s. `up.sh` prints the build log only when the build fails (the classic builder ignores
 `--quiet`).
@@ -277,7 +343,7 @@ about 1 s. `up.sh` prints the build log only when the build fails (the classic b
 | `ctl.sh evict <service> <path>` | `dd if=<path> iflag=nocache count=0` inside the container: drops the file from the page cache. Measured on `big.bin`: 13–56 ms to read when cached, 380–600 ms after eviction. `fincore` reports 0 pages for files on overlayfs whether cached or not, so it cannot confirm an eviction here; `check.sh` compares read times instead. |
 | `ctl.sh conns <service>` | TCP connections to port 445 from outside the container since the last reset (see below) |
 | `ctl.sh conns-reset <service>` | sets that count to zero |
-| `ctl.sh pause <service>` / `unpause <service>` | `docker pause` / `docker unpause` |
+| `ctl.sh pause <service>` / `unpause <service>` | `docker pause` / `docker unpause`; also `samba-dc` (a silent KDC: TCP is accepted, nothing answers) |
 | `ctl.sh drops` | packets netem on `wan` has dropped since the container started (summed over its qdiscs). Fails if `wan` cannot be asked, so a broken `docker exec` never reads as 0. `check.sh`, the benchmark and both spikes use it. |
 
 ### The lock: `/tmp/rsmb-env.lock`
@@ -288,7 +354,7 @@ One `flock` file arbitrates who may disturb the environment. The convention, in 
 |---|---|---|
 | `check.sh` | exclusive, whole run | resets connection counters, turns the blackhole on and off |
 | `up.sh` | exclusive, only while it unpauses servers and turns the blackhole off | cleans up after an interrupted spike without disturbing a running one |
-| `./test.sh`, stale test directories | exclusive, only while it removes `upload/rsmb-test-*` on the three Samba servers | a test run or benchmark holding the shared lock may be writing there |
+| `./test.sh`, stale test directories | exclusive, only while it removes `upload/rsmb-test-*` on the three Samba servers and the DC | a test run or benchmark holding the shared lock may be writing there |
 | `spikes/*/run.sh`, steps 5, 6, 7c, 8, 10, 11 (smb-rs) and 5, 6, 10 (smb2) | exclusive, per step | timed 1.1 GiB transfers, cache eviction, pause, blackhole, `conns` counting |
 | `spikes/*/run.sh`, all other steps | shared, per step | ordinary requests that must not be disturbed |
 | `testenv/bench-smbclientng.sh` | shared, whole run | timed runs that must not be disturbed; changes nothing |
@@ -296,7 +362,7 @@ One `flock` file arbitrates who may disturb the environment. The convention, in 
 | `testenv/bench-rsmb.sh transfers` | exclusive, whole run | timed bulk transfers at the slow endpoint and iperf3, which tests running beside it would distort |
 | `testenv/bench-rsmb.sh walk` | shared, whole run | timed walks beside smbclient-ng; changes nothing |
 | `./test.sh`: `tests/fast`, `tests/fast through the proxy`, `tests/slow` | shared, per step (`flock -s`) | ordinary requests; each test has its own tap. The proxied step counts the proxy's log lines before and after; other shared holders can only add to them |
-| `./test.sh`: `tests/serial` | exclusive, per step (`flock -x`) | pauses `samba` and `socks`, turns the blackhole on, resets connection counters, counts the proxy's log lines exactly, asserts wall times |
+| `./test.sh`: `tests/serial` | exclusive, per step (`flock -x`) | pauses `samba`, `socks` and `samba-dc`, turns the blackhole on, resets connection counters, counts the proxy's log lines exactly, asserts wall times |
 | `ctl.sh`, `validate-smbtap.sh` | none themselves | |
 | `./test.sh`, other steps | none | `check.sh` takes its own exclusive lock, so `./test.sh` holds none while calling it |
 
@@ -329,7 +395,11 @@ reset, three direct connects and one through `wan` read as exactly 4.
 It uses only tools independent of this project's code and fails with a non-zero exit and a `FAIL`
 line per broken assumption:
 
-1. All six containers healthy (stops here otherwise); prints the Samba version.
+`check.sh` exports `KRB5_CONFIG=/dev/null` at its top: the host's `smbclient` tries Kerberos by
+default and would read the host's `/etc/krb5.conf`, which may describe another realm. Nothing in
+it depends on the host's Kerberos configuration or ticket caches.
+
+1. All seven containers healthy (stops here otherwise); prints the Samba version.
 2. TCP connect time (not ping: only one direction of a ping crosses each netem qdisc on the way
    out): fast < 5 ms, slow 195–230 ms, `wan-bad` > 150 ms.
 3. Logins: `TESTDOM\tester`; wrong password refused; guest and anonymous read `guest`; guest
@@ -349,6 +419,15 @@ line per broken assumption:
    eviction makes a read at least 3× slower.
 8. iperf3 through `wan` runs; netem on `wan` dropped no packet; `wan-bad`'s drop counters are
    printed (loss is intended there).
+9. Kerberos and the DC (after point 5): inside the DC its own `kinit` and `smbclient
+   --use-kerberos=required` read `hello.txt` (`kerberos works`); `kvno` gets a ticket for each of
+   `cifs/10.213.45.12`, `cifs/127.0.0.1`, `cifs/10.213.45.10`, `cifs/dc.rsmb.test` and refuses
+   `cifs/nosuch.rsmb.test`; the KDC's log gained at least 4 `TGS-REQ tester@RSMB.TEST from ipv4:`
+   lines meanwhile (the wording the tests count); `mkcache -f tester cifs/dc.rsmb.test` writes at
+   least 1,000 bytes that start `05 04`; `dc.rsmb.test` and `rsmb.test` do not resolve on the
+   host, and the proxy's port 1080 resolves both and gets an SMB2 answer; the KDC
+   10.213.45.12:88 is reachable from the host without the proxy (within 3 s); the host's
+   `smbclient --use-kerberos=off` with a wrong password at the DC gets `NT_STATUS_LOGON_FAILURE`.
 
 ## Tests
 
@@ -362,14 +441,15 @@ line per broken assumption:
 
 `fast` is everything without injected latency: `tests/fast` direct to `samba`, then the same
 binary through `socks` to `samba-private` (`RSMB_TEST_VIA=socks5`), so `tests/fast` needs
-`socks` and `samba-private` as well as `samba`.
+`socks` and `samba-private` as well as `samba`; its Kerberos tests need `samba-dc` (by address
+direct, as `dc.rsmb.test` through the proxy).
 
-"Stale test directories" removes `upload/rsmb-test-*` on the three Samba containers with
+"Stale test directories" removes `upload/rsmb-test-*` on the three Samba containers and the DC with
 `docker exec`. Every test that writes to a server does it below a scratch directory of its own,
 `upload/rsmb-test-<pid>-<n>` (owned by tester, removed when the test ends, also when it fails);
 `tiny` is used by one test only, which empties it. Each step prints its duration; the last line
 prints the counted time against the budget (150 s for `fast`, 600 s full; Stage 1 had 90 and 240,
-Stage 2 120 and 420, Stage 3 120 and 540). The measured times are in `docs/testing.md`.
+Stage 2 120 and 420, Stage 3 120 and 540; Stage 5 kept 150 and 600). The measured times are in `docs/testing.md`.
 
 The tests of `tree` and `find` compare with the server's own `find`, run in the container **as
 tester** (`docker exec -u tester -w /srv/share …`), so it sees what the SMB user sees (as root it
@@ -379,6 +459,6 @@ tester). The containers are Alpine: `find` is BusyBox on musl, with `-name`, `-i
 its matcher takes names as UTF-8 without any locale variable.
 
 The interactive tests run rsmb on a pseudo-terminal through `testenv/ptyrun.py` (python3's `pty`
-module; python3 is a host requirement already). The serial tests pause `samba` or `socks` and turn the
+module; python3 is a host requirement already). The serial tests pause `samba`, `socks` or `samba-dc` and turn the
 blackhole on; each undoes it in a guard that also runs when the test fails, and `up.sh` cleans up
 after a killed run.

@@ -1,0 +1,12 @@
+#!/bin/sh
+# mkcache -f|-F <user> [<spn>...]: a new ticket cache for <user> (password testpass) with a
+# ticket-granting ticket that is forwardable (-f) or not (-F), plus one service ticket per <spn>;
+# writes the cache file's bytes to stdout. Used by the tests and by check.sh.
+set -eu
+c=$(mktemp -u /tmp/mkcache.XXXXXX)
+trap 'rm -f "$c"' EXIT
+flag=$1 user=$2
+shift 2
+echo testpass | kinit "$flag" -c "FILE:$c" "$user@RSMB.TEST" >/dev/null
+[ $# -eq 0 ] || kvno -q -c "FILE:$c" "$@" >/dev/null
+cat "$c"

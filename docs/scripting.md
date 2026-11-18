@@ -18,12 +18,19 @@ interactive shell starts; otherwise rsmb exits. So `rsmb … -C ls` with an inhe
 exits by itself, and `-N` is only needed to suppress the shell when running from a terminal.
 
 - Blank lines and lines whose first non-blank character is `#` are skipped and print nothing.
-- The run stops at the first failing command, with that command's exit code. With `-k`
-  (`--keep-going`) it goes on and exits with the code of the first failure. `exit` ends the run.
+- The run stops at the first failing command, with that command's exit code. With
+  `--keep-going` (long form only) it goes on and exits with the code of the first failure. `exit`
+  ends the run.
 - If stdout cannot be written (the reader closed the pipe, `| head -1`) the run ends at once with
-  exit 1 and `rsmb: cannot write to stdout` on stderr, also with `-k`.
-- rsmb never prompts when stdin is not a terminal: a user name without `-p` or `--no-pass` is a
-  usage error (exit 2) before anything is sent.
+  exit 1 and `rsmb: cannot write to stdout` on stderr, also with `--keep-going`.
+- rsmb never prompts when stdin is not a terminal: a user name without `-p`, `--no-pass` or `-k` is
+  a usage error (exit 2) before anything is sent. `-k` (Kerberos from the ticket cache) never
+  prompts and needs no `-p`.
+- **`-k` changed its meaning.** It used to be the short form of `--keep-going`; it is now
+  Kerberos. An old script that passes `-k` with `-p` or `--no-pass` now exits 2 (`usage`); one
+  without either (an anonymous run such as `rsmb -H h -N -k -C ls`) is now a Kerberos login as the
+  principal of the default cache: an `auth` error when there is no cache, a login as that
+  principal when there is one. Write `--keep-going`.
 - `RSMB_HISTORY=` (empty) disables the history file; scripts do not need it.
 
 ## Exit codes
@@ -31,9 +38,9 @@ exits by itself, and `-N` is only needed to suppress the shell when running from
 | Code | Meaning |
 |---|---|
 | 0 | every command succeeded (or the shell ended with exit or Ctrl-D) |
-| 1 | a command failed (the first failure stops a non-interactive run unless -k) |
+| 1 | a command failed (the first failure stops a non-interactive run unless --keep-going) |
 | 2 | usage: a bad flag, a bad command line, an unknown command, no share selected, no password without a terminal |
-| 3 | connecting or logging in failed at start-up, a proxy failure included |
+| 3 | connecting or logging in failed at start-up, a proxy or Kerberos failure included |
 | 130 | interrupted: SIGINT or SIGTERM dropped a running command or the start-up connect; SIGTERM also ends the interactive shell (Ctrl-C there only returns to the prompt) |
 
 ## `--json`
@@ -58,7 +65,7 @@ that prints a name to a terminal must filter it itself; a name from `--json` can
 - **`--json` never starts the line editor**, whatever stdin is, so every stdout line is one JSON
   object. With a terminal on stdin and no `-C` or `-S`, lines typed there are read one by one like
   lines from a pipe, **under the rules of a non-interactive run**: no prompt, no history, no
-  completion; the first failing command ends the session with its exit code unless `-k`; Ctrl-C
+  completion; the first failing command ends the session with its exit code unless `--keep-going`; Ctrl-C
   during a command ends the run with 130 after the cleanup; Ctrl-C between commands exits 130;
   nothing asks to overwrite (`already_exists`); Ctrl-D ends it. A password prompt (no `-p`, a
   user name) still goes to the terminal device, not to stdout. With `-C` or `-S` the commands run
@@ -123,6 +130,7 @@ Example lines (from the test server):
 {"command":"cd nope","ok":false,"type":"done"}
 {"command":null,"kind":"connect","message":"connect to 127.0.0.1:1: Connection refused (os error 111)","type":"error"}
 {"command":null,"kind":"connect","message":"proxy 10.213.45.20:1081: user name or password refused","type":"error"}
+{"command":null,"kind":"auth","message":"Kerberos: ticket cache /tmp/krb5cc_rsmb: No such file or directory (os error 2)","type":"error"}
 {"bytes":65537,"direction":"get","local":"/home/user/65537.bin","remote":"/sizes/65537.bin","seconds":0.004,"type":"transfer"}
 {"command":"get -r /loops","kind":"other","message":"/loops/self: not copied: the same directory as /loops (a link, or a server that reuses file ids)","path":"/loops/self","type":"error"}
 {"bytes":5,"direction":"get","directories":1,"failed":2,"files":1,"seconds":0.007,"type":"summary"}
@@ -154,12 +162,46 @@ rsmb --proxy socks5://tester:testpass@10.213.45.20:1081 -H fileserver.rsmb.test 
 echo "exit code $?"     # 3 with {"kind":"connect","message":"proxy …"} if the proxy failed
 ```
 
+## With Kerberos (`-k`)
+
+`-k` logs in from the ticket cache: no `-p`, no prompt, user and realm from the cache
+([`commands.md`](commands.md), "Kerberos"). rsmb reads two environment variables for it:
+`KRB5CCNAME` (the cache file: `FILE:<path>` or a path; not set: `/tmp/krb5cc_<uid>`) and
+`KRB5_CONFIG` (the `krb5.conf` files that may name the realm's KDC; not set: `/etc/krb5.conf`;
+without a `kdc` there, the realm's name in lower case, port 88). A cache that holds the service
+ticket for `cifs/<-H>` needs no KDC at all.
+
+A Kerberos failure at start-up is the one `error` object with `"command":null`, exit 3, no
+`done`, and a message that starts `Kerberos: `. Its kind says what to do:
+
+- `auth`: the cache (missing, another type, another owner, not a cache, expired, no ticket for
+  the server, another principal than `-u`/`-d`) or a refusal by the KDC or the server. Get new
+  tickets (`kinit -f`, `kvno cifs/<host>`) or fix the command line; retrying the same does not
+  help.
+- `connect`: the KDC could not be asked (refused, no answer within 10 s, closed, or the proxy
+  could not reach it). Retry later, or name the KDC with a `krb5.conf` of your own in
+  `KRB5_CONFIG`.
+
+On a reconnect the command's `error` says `reconnect failed: Kerberos: …`, exit 1. A session ends
+when its ticket does: a reading command is run again on a new login that reads the cache as it
+then is (it works with new tickets; with the old ones it fails with kind `auth`, `reconnect
+failed: Kerberos: the ticket for … expired at …; run kinit`), and a command that changes
+something (`mkdir`, `put`, `rm`, …) fails with `connection_lost` and is not run again; the next
+command logs in again.
+
+```bash
+kinit -f alice@CORP.EXAMPLE                     # or: KRB5CCNAME=/path/to/cache
+rsmb -k -H fs1.corp.example --json -C 'use docs' -C 'ls'
+echo "exit code $?"     # 3 with {"kind":"auth","message":"Kerberos: …"} if the cache is no good
+```
+
 ## Driving rsmb as a coprocess
 
 Start one process with `--json --keep-going` and a pipe on stdin; write one command line, read
 lines until the `done` line, repeat. The session (connection, share, working directory, cache)
 lives as long as the process, so every command after the first costs only its own round trips.
-Close stdin (or send `exit`) to end it. `-k` keeps the session alive after a failed command.
+Close stdin (or send `exit`) to end it. `--keep-going` keeps the session alive after a failed
+command.
 
 ## Examples
 
@@ -224,7 +266,7 @@ tokeniser's own quoting (`it\'s.txt`).
 bash, upload a directory and check the summary:
 
 ```bash
-rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM --json -k \
+rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM --json --keep-going \
      -C 'use share' -C 'cd upload' -C 'put -r photos' |
   jq -c 'select(.type == "summary" or (.type == "error" and .path != null))'
 # {"bytes":…,"direction":"put","directories":…,"failed":0,"files":…,"seconds":…,"type":"summary"}

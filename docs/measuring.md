@@ -135,6 +135,15 @@ commands counted through the tap direct and through both proxy ports, the same r
 row and the same flights wherever requests do not overlap. `validate-smbtap.sh` is unchanged: the
 counting code is the same.
 
+**Kerberos (Stage 5).** A TGT-only Kerberos login opens a second connection, to the KDC, port 88.
+Through a tap in SOCKS5 mode that connection would pass the tap as a second connection of frames
+it cannot read (Kerberos, not SMB), so such runs are not tapped: a tapped session through the
+proxy holds the service ticket in its cache, and no KDC is asked. Direct, the tap stands in front
+of the server only (`-H 127.0.0.1`, service name `cifs/127.0.0.1`) and the KDC's connection goes
+beside it: a TGT-only start-up is still 2 requests in 2 flights on 1 connection in the tap. KDC
+requests are counted in the KDC's own log instead (`docs/test-environment.md`, "The Kerberos
+server").
+
 ### CLI
 
 ```

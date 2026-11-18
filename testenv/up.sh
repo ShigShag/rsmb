@@ -15,7 +15,7 @@ if [ ! -d /sys/module/sch_netem ] && ! compgen -G "/lib/modules/$k/kernel/net/sc
 fi
 
 # The classic builder (no buildx here) ignores --quiet, so the build log is shown only on failure.
-echo "up.sh: building images (cached: seconds; from nothing: about 68 s)"
+echo "up.sh: building images (cached: seconds; from nothing: about 150 s)"
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 if ! docker compose build >"$log" 2>&1; then

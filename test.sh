@@ -51,7 +51,7 @@ step "test environment up"
 
 step "stale test directories"
 # Exclusive: a test that holds the shared lock may be writing to one of these directories.
-locked -x bash -c 'for c in rsmb-samba rsmb-samba-edge rsmb-samba-private; do
+locked -x bash -c 'for c in rsmb-samba rsmb-samba-edge rsmb-samba-private rsmb-samba-dc; do
     docker exec "$c" sh -c "rm -rf /srv/share/upload/rsmb-test-*"
 done'
 

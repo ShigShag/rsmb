@@ -130,3 +130,26 @@ services:
     networks:
       pub: { ipv4_address: 10.213.45.20 }
       priv: { ipv4_address: 10.213.47.20 }
+
+  # The Kerberos server: a Samba AD DC (realm RSMB.TEST) with its own KDC, provisioned at build.
+  samba-dc:
+    build: samba-dc
+    image: rsmb-samba-dc
+    pull_policy: never            # built locally
+    container_name: rsmb-samba-dc
+    hostname: dc
+    init: true
+    healthcheck:
+      # SMB (445 = 0x01BD) and the KDC (88 = 0x0058) in LISTEN state, without connecting.
+      test: ["CMD-SHELL", "grep -q ':01BD 00000000:0000 0A' /proc/net/tcp && grep -q ':0058 00000000:0000 0A' /proc/net/tcp"]
+      interval: 2s
+      timeout: 5s
+      retries: 2
+      start_period: 60s
+      start_interval: 1s
+    networks:
+      pub:
+        ipv4_address: 10.213.45.12
+        # Only the proxy (on pub) resolves these; rsmb.test is the realm's own name, where rsmb
+        # looks for the KDC when no krb5.conf names one.
+        aliases: [dc.rsmb.test, rsmb.test]

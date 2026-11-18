@@ -19,33 +19,38 @@ under `upload/`).
 ## Starting rsmb
 
 ```
-rsmb -H <host> [-P <port>] [-u <user>] [-d <domain>] [-p <password> | --no-pass]
+rsmb -H <host> [-P <port>] [-k] [-u <user>] [-d <domain>] [-p <password> | --no-pass]
      [--proxy socks5://[user:pass@]host:port] [--timeout <seconds>]
-     [-S <file>] [-C <command>]... [-N] [-k] [--json]
+     [-S <file>] [-C <command>]... [-N] [--keep-going] [--json]
 rsmb --help-all [--json]
 ```
+
+`-k` excludes `-p` and `--no-pass`; `-u` and `-d` may be given with it and must then match the
+ticket cache.
 
 | Flag | Meaning |
 |---|---|
 | `-H`, `--host <HOST>` | server name or address; required unless `--help-all` |
 | `-P`, `--port <PORT>` | default 445 (`help all` shows `[default: 445]`) |
-| `-u`, `--user <USER>` | default empty = anonymous; `Guest` = guest. `DOMAIN\user` is split at the first backslash when `-d` is not given |
-| `-d`, `--domain <DOMAIN>` | default empty |
+| `-u`, `--user <USER>` | default empty = anonymous; `Guest` = guest. `DOMAIN\user` is split at the first backslash when `-d` is not given. With `-k`: optional, and if given it must match the ticket cache's user (without regard to case) |
+| `-d`, `--domain <DOMAIN>` | default empty. With `-k`: the realm, optional, must match the cache's realm (a NetBIOS domain name does not) |
 | `-p`, `--password <PASSWORD>` | conflicts with `--no-pass`; visible in the process list |
 | `--no-pass` | empty password, never prompt |
+| `-k`, `--kerberos` | log in with Kerberos from the ticket cache (`KRB5CCNAME`, else `/tmp/krb5cc_<uid>`): no password, never a prompt; user and realm come from the cache. Not with `-p` or `--no-pass` (exit 2). **`-k` used to be the short form of `--keep-going`**: an old command line with `-k` and `-p` or `--no-pass` is now refused, one without either (an anonymous run, or one that waited for the password prompt) is now a Kerberos login as the principal of the default cache. See "Kerberos" below |
 | `--proxy <URL>` | connect through a SOCKS5 proxy, `socks5://[user:pass@]host:port` (`socks5h://` is the same; one trailing `/` is accepted); the proxy resolves the server's name. User and password are percent-decoded (`%40` for `@`, `%3A` for `:`, `%25` for `%`), 1 to 255 bytes each; an IPv6 proxy is written `socks5://[::1]:1080`. Anything else is a usage error whose message never repeats the URL. Visible in the process list, like `-p`. See "Proxy" below |
 | `--timeout <SECONDS>` | response deadline, default 30 (`[default: 30]` in `help all`), at least 1 (see "Timeouts and reconnect"); connecting has its own 10 s, through a proxy too, which `--timeout` does not change |
 | `-S`, `--startup-script <FILE>` | run the commands in the file, one per line, first |
 | `-C`, `--command <LINE>` | run one command line; repeatable, in order, after `-S` |
 | `-N`, `--not-interactive` | no interactive shell after the commands |
-| `-k`, `--keep-going` | do not stop at the first failing command; the exit code is that of the first failure |
+| `--keep-going` | do not stop at the first failing command; the exit code is that of the first failure. Long form only (`-k` is Kerberos) |
 | `--json` | one JSON object per stdout line ([`scripting.md`](scripting.md)) |
 | `--help-all` | print the manual (as JSON objects with `--json`) and exit 0; needs no server |
-| `-h`, `--help`, `-V`, `--version` | short help, version |
+| `-h`, `--help`, `-V`, `--version` | short help (one line per flag, within 80 columns; the full text of each flag is in `--help-all`), version |
 
-Start-up costs 3 requests (NEGOTIATE, 2 × SESSION_SETUP) on one TCP connection. Without `-p` and
-`--no-pass`, and with a user name, rsmb asks for the password on the terminal (`Password for
-DOMAIN\user:`), but only when stdin is a terminal; otherwise it exits 2 with `no password: give
+Start-up costs 3 requests (NEGOTIATE, 2 × SESSION_SETUP) on one TCP connection; with `-k` 2
+(NEGOTIATE, 1 × SESSION_SETUP). Without `-p`, `--no-pass` and `-k`, and with a user name, rsmb
+asks for the password on the terminal (`Password for DOMAIN\user:`), but only when stdin is a
+terminal; otherwise it exits 2 with `no password: give
 -p or --no-pass` before anything touches the network. Guest is `-u Guest --no-pass`; anonymous is
 no `-u` at all. A server that maps unknown users to guest answers a wrong user name with a guest
 session; rsmb refuses that login (exit 3) and says to use `-u Guest --no-pass` on purpose.
@@ -58,14 +63,14 @@ session; rsmb refuses that login (exit 3) and says to use `-u Guest --no-pass` o
   was given, commands are read from stdin, one per line, until end of input. Otherwise rsmb
   exits. **`--json` never starts the line editor** (its prompt and echo would go to stdout): lines
   typed at a terminal are read like lines from a pipe, under the same rules: the first failing
-  command ends the run unless `-k`, Ctrl-C during a command ends the run with 130 after the
+  command ends the run unless `--keep-going`, Ctrl-C during a command ends the run with 130 after the
   cleanup, Ctrl-C between commands exits 130, and nothing asks to overwrite. With `-C` or `-S`, stdin is never read, so a caller
   that leaves a pipe open on rsmb's stdin does not make it wait.
 - A blank line and a line whose first non-blank character is `#` are skipped and print nothing.
 - A non-interactive run stops at the first failing command with that command's exit code. With
-  `-k` it goes on, and exits with the code of the first failure. `exit` and end of input end the
+  `--keep-going` it goes on, and exits with the code of the first failure. `exit` and end of input end the
   run. If stdout cannot be written (the reader closed
-  the pipe) the run ends at once with exit 1, also with `-k`: no further command is sent. In the interactive shell a failed start-up line does not stop the shell.
+  the pipe) the run ends at once with exit 1, also with `--keep-going`: no further command is sent. In the interactive shell a failed start-up line does not stop the shell.
 - **The overwrite prompt.** In the interactive shell, a `get` or `put` of one file (no `-r`, no
   `-f`) onto an existing target asks `<message> Overwrite? [y/N] `; an answer starting with `y` or
   `Y` runs the same line again with `-f`, anything else (and Ctrl-C, Ctrl-D) prints the
@@ -703,7 +708,9 @@ help [<command>|all]
 whole manual, the same as `rsmb --help-all`: what rsmb is, the start-up flags (from the flag
 parser itself, so they cannot drift), how commands are given, quoting and paths, every command,
 the `--json` objects, the exit codes, transfers, timeouts and reconnect, tree and find, two
-complete examples. 0 requests.
+complete examples. 0 requests. As text the manual is wrapped at spaces to 80 columns, a flag's
+help and a command's summary continuing under their own column; a word longer than a line stays
+whole. With `--json` every string is whole.
 With `--json` the manual is printed as `command`, `option`, `exit_code`, `json_object` and `topic`
 objects.
 
@@ -720,7 +727,7 @@ exit
 ```
 
 Ends the session (0 requests). The exit code is that of the first failed command of a
-non-interactive run with `-k`, otherwise 0. Ctrl-D at the prompt does the same.
+non-interactive run with `--keep-going`, otherwise 0. Ctrl-D at the prompt does the same.
 
 Example:
 
@@ -731,9 +738,9 @@ Example:
 | Code | Meaning |
 |---|---|
 | 0 | every command succeeded (or the shell ended with exit or Ctrl-D) |
-| 1 | a command failed (the first failure stops a non-interactive run unless -k) |
+| 1 | a command failed (the first failure stops a non-interactive run unless --keep-going) |
 | 2 | usage: a bad flag, a bad command line, an unknown command, no share selected, no password without a terminal |
-| 3 | connecting or logging in failed at start-up, a proxy failure included |
+| 3 | connecting or logging in failed at start-up, a proxy or Kerberos failure included |
 | 130 | interrupted: SIGINT or SIGTERM dropped a running command or the start-up connect; SIGTERM also ends the interactive shell (Ctrl-C there only returns to the prompt) |
 
 ## Timeouts and reconnect
@@ -849,9 +856,152 @@ proxy that needs none takes none).
 
 Example: `rsmb --proxy socks5://127.0.0.1:1080 -H fileserver.example -u alice -d CORP -N -C 'use docs' -C 'ls'`.
 
+## Kerberos
+
+`-k` (`--kerberos`) logs in with Kerberos from the ticket cache and never asks for a password; it
+cannot be combined with `-p` or `--no-pass` (`usage`, exit 2). rsmb never writes the cache, keeps
+no service ticket it obtained, and **never falls back to a password** (NTLM) when Kerberos fails.
+
+- **The cache** is the file `KRB5CCNAME` names: `FILE:<path>` or a path (a name that is not UTF-8
+  is the variable's too). Not set, or empty: `/tmp/krb5cc_<uid>`. Other cache types (`KCM:`, `KEYRING:`, `DIR:`, `MEMORY:`, `API:`, any
+  `<type>:<rest>` that is not a path) are not read: put the tickets into a file (`kinit -c
+  /tmp/krb5cc_rsmb <user>`) and set `KRB5CCNAME` to it. `default_ccache_name` of `krb5.conf` is not
+  read. The file must **belong to the user rsmb runs as** (the default file lies in
+  world-writable `/tmp`, and a cache of another user would log the session in as that user's
+  principal); root using a user's cache must copy it. The cache is read again at every login, the
+  first and every reconnect.
+- **Who.** User and realm are the cache's default principal, as the cache spells them. `-u` and
+  `-d` are optional; given, they must equal the cache's user and realm without regard to ASCII
+  case (`-d` is the realm: a NetBIOS domain such as `RSMB` for the realm `RSMB.TEST` does not
+  match). After the first login the session keeps that principal: a reconnect that finds another
+  one in the cache fails and names both. A principal with more than one name part is not
+  supported.
+- **The server's name.** The ticket is for `cifs/<-H as given>`: `-H` must be the name the server
+  has in the realm (usually its full DNS name); a short name or a DNS alias is another service
+  name. `-H <address>` works when the cache holds a ticket for `cifs/<address>` or the realm has
+  that service name; otherwise the KDC refuses it (`has no service`). Through a proxy the name goes
+  to the proxy and into the service name as given.
+- **With the service ticket in the cache** (`kvno cifs/<host>` puts it there) no KDC is asked:
+  the login is 2 requests, NEGOTIATE and SESSION_SETUP, in 3 round trips with the TCP connect
+  (NTLM: 3 requests, 4 round trips).
+- **With a ticket-granting ticket only**, rsmb asks the KDC once per login for the service
+  ticket, over TCP port 88, 10 s at most for the whole exchange (the connect, with a proxy its
+  handshake, the request and the answer; `--timeout` does not change it): 5 round trips in all.
+  The ticket it gets is used for that login and dropped. **The KDC** is the first `kdc` of the
+  realm in the first file of `KRB5_CONFIG` (a colon-separated list) that names one, or in
+  `/etc/krb5.conf` when `KRB5_CONFIG` is not set; otherwise the realm's own DNS name in lower case,
+  port 88 (`CORP.EXAMPLE` gives `corp.example:88`), as a domain's name resolves to its domain
+  controllers in Active Directory. One KDC; no DNS SRV lookup, no `include`, no second KDC, no
+  realm across realms. To name another KDC without root, write a file with the four lines
+
+  ```
+  [realms]
+  CORP.EXAMPLE = {
+    kdc = kdc1.corp.example
+  }
+  ```
+
+  and set `KRB5_CONFIG` to it.
+- **The ticket-granting ticket must be forwardable and renewable** (`kinit -f`; add `-r 7d` where
+  it is not renewable): rsmb asks for a forwardable, renewable service ticket (the library's fixed
+  options), and a KDC that enforces RFC 4120, as Samba's does, refuses that for a ticket-granting
+  ticket that is not both (`KDC_ERR_BADOPTION`). The other way out: put the service ticket into the
+  cache with `kvno cifs/<host>`.
+- **Through `--proxy`** the KDC is reached through the proxy too, by name (the proxy resolves it),
+  and nothing goes around the proxy: no packet, no name lookup on this host.
+- **Expiry.** A ticket whose end time is not after now (this host's clock, no allowance) is
+  removed before the library sees the cache; if nothing usable is left, rsmb says which ticket
+  expired and when. **A session ends when its ticket does**: the server then answers every request
+  `STATUS_NETWORK_SESSION_EXPIRED`, the command fails with `connection_lost` (`connection lost: the
+  server ended the session (with -k: the ticket's lifetime is over)`), a reading command runs once
+  more on a new login, and that login reads the cache again: with new tickets it works, with the
+  old ones it says `reconnect failed: Kerberos: the ticket for … expired at …; run kinit`.
+- **Failures.** Every Kerberos failure is one line that starts `Kerberos: `, of kind `auth` or
+  `connect` (no new kind), exit 3 at start-up (one `error` with `"command":null`, no `done`), exit
+  1 when a reconnect fails (`reconnect failed: Kerberos: …`). `auth`: the cache, or a refusal by
+  the KDC or by the server: ask for new credentials. `connect`: the KDC could not be asked: try
+  again later, or name another KDC. What is wrong with the cache is found before anything is
+  dialled.
+
+  | Case | Kind | Message after `Kerberos: ` |
+  |---|---|---|
+  | `KRB5CCNAME` names another cache type | `auth` | `KRB5CCNAME names a ticket cache of type '<TYPE>'; rsmb reads a cache file only. Put the tickets into a file and name it: kinit -c /tmp/krb5cc_rsmb <user>; KRB5CCNAME=/tmp/krb5cc_rsmb` |
+  | the file cannot be opened or read | `auth` | `ticket cache <path>: <error>` (for example `No such file or directory (os error 2)`) |
+  | the file is not a regular file (a FIFO, a directory, a device) | `auth` | `ticket cache <path>: not a regular file`; found without waiting for a writer, so a FIFO does not hang rsmb |
+  | the file belongs to another user | `auth` | `ticket cache <path> belongs to uid <n>, not to the user rsmb runs as (uid <m>); rsmb uses a cache of its own user only` |
+  | not a cache | `auth` | `<path> is not a ticket cache rsmb can read (<the library's words>)` |
+  | a principal with two name parts | `auth` | `the ticket cache <path> belongs to '<a/b>@<realm>'; a principal with more than one name part is not supported` |
+  | `-u` or `-d` differ, or the principal changed since the first login | `auth` | `the ticket cache <path> belongs to '<user>@<realm>', not to '<user given>' in '<domain given>' (given with -u and -d, or the principal this session logged in as). With -k leave -u and -d out, or give the cache's own` |
+  | every usable ticket has expired | `auth` | `the ticket for <server> in <path> expired at <RFC 3339 time>; run kinit` |
+  | no ticket for the server and no ticket-granting ticket | `auth` | `<path> holds no ticket for cifs/<host>@<realm> and no ticket-granting ticket for <realm>; run kinit <user>@<realm>` |
+
+  When `KRB5CCNAME` is not set, the read, expired and no-ticket messages go on with
+  ` (KRB5CCNAME is not set, so the default file <path> was used; if kinit writes somewhere else,
+  for example to a KCM or KEYRING cache, set KRB5CCNAME to a cache file: kinit -c <file>)`.
+
+  The KDC's failures: `Kerberos: asking the KDC <host>:<port> for a ticket for cifs/<host>:
+  <reason>`.
+
+  | Case | Kind | `<reason>` |
+  |---|---|---|
+  | the dial to the KDC failed, direct or at the proxy | `connect` | the dial's own message: `connect to <kdc>: Connection refused (os error 111)`, `connect to <kdc>: no answer within 10 s`, `connect to <kdc>: failed to lookup address information: …`, `proxy <proxy>: cannot reach <kdc>: host unreachable`, `proxy <proxy>: user name or password refused`, … ("Proxy" above) |
+  | connected, no answer | `connect` | `connected to the KDC, but it did not answer within 10 s` |
+  | the KDC closed the connection | `connect` | `the KDC closed the connection without an answer` |
+  | KRB-ERROR 7 | `auth` | `the realm <realm> has no service cifs/<host>: give -H the name the server has in the realm` |
+  | KRB-ERROR 13 | `auth` | `refused (KDC_ERR_BADOPTION): rsmb asks for a forwardable, renewable ticket, and this KDC gives one only for a ticket-granting ticket that is both. Get one with kinit -f (add -r 7d if it is not renewable), or put the service ticket into the cache: kvno cifs/<host>` |
+  | KRB-ERROR 32 | `auth` | `the KDC says the ticket-granting ticket has expired; run kinit` |
+  | KRB-ERROR 36 | `auth` | `the KDC does not accept the ticket-granting ticket for '<user>@<realm>' (KRB_AP_ERR_BADMATCH)` |
+  | KRB-ERROR 37 | `auth` | `the clocks of this host and the KDC differ too much` |
+  | any other KRB-ERROR | `auth` | `KDC error <code>`, and `: <text>` when the KDC sent one |
+
+  The three `connect` rows say where the address came from: ` (the KDC is the one <file> names
+  for <realm>)`, or ` (no kdc for <realm> in <the files looked at>, so the realm's name was tried.
+  To name the KDC, write a file with the four lines "[realms]", "<realm> = {", "kdc = <the KDC's
+  host>", "}" and set KRB5_CONFIG to it; or put the service ticket into the cache: kvno
+  cifs/<host>)`. They never send you to a file only root can write.
+
+  The server's answer to the ticket, after `Kerberos: login as '<realm>\<user>' at <host>:<port>: `:
+
+  | Case | Kind | Message |
+  |---|---|---|
+  | the server refuses the login (`STATUS_LOGON_FAILURE`, …) | `auth` | `login refused (…)` |
+  | the server answers with another status (an expired ticket more than five minutes past its end, a server outside the realm: both `STATUS_INVALID_PARAMETER`) | `auth` | `the server did not accept the ticket (<status>); is <host> in the realm <realm>, and is the ticket valid on the server's clock?` |
+  | the library could not use the ticket in the cache or the KDC's answer (an unknown encryption type, a ticket it cannot parse, an answer that does not decrypt, a SESSION_SETUP answer whose signature fails) | `auth` | `the ticket in the cache or the KDC's answer could not be used (<the library's words>)` |
+
+  A file the library's cache parser cannot cope with in one particular way (a principal that
+  claims billions of name parts) ends the process with exit 134 and no `error` object
+  ([`known-limitations.md`](known-limitations.md)).
+- **Cost.** With the service ticket: 2 requests in 2 flights, 3 round trips with the TCP connect;
+  with a ticket-granting ticket only: the same 2 requests, plus a TCP connect to the KDC and one
+  exchange (5 round trips), once per login. A reconnect with `ls` is 8 requests (NEGOTIATE,
+  SESSION_SETUP, TREE_CONNECT and the 5 of a listing).
+- **The banner** says how: `logged in as 'RSMB.TEST\tester' (Kerberos) on dc.rsmb.test:445
+  through proxy 10.213.45.20:1080 (SMB 3.1.1)`.
+- **Two environment variables**: `KRB5CCNAME` (the cache) and `KRB5_CONFIG` (where the KDC is
+  named), each taken as bytes, so a name that is not UTF-8 is not mistaken for unset. A
+  `KRB5_CONFIG` file that is not a regular file (a FIFO, say) counts as one that cannot be read:
+  absent. Nothing else of the system's Kerberos is used.
+
+Examples:
+
+```
+kinit -f alice@CORP.EXAMPLE
+rsmb -k -H fs1.corp.example -N -C 'use docs' -C 'ls'
+kvno cifs/fs1.corp.example     # put the service ticket into the cache: no KDC at login
+KRB5CCNAME=/tmp/krb5cc_rsmb rsmb -k --proxy socks5://127.0.0.1:1080 -H fs1.corp.example
+```
+
 ## Differences from smbclient-ng
 
 - smbclient-ng has no proxy option; rsmb has `--proxy socks5://…`.
+- **Kerberos.** Both take `-k`. smbclient-ng's `-k` is a flag of its own as well; rsmb's `-k` used
+  to be the short form of `--keep-going` (see the flag table for what that does to an old command
+  line). rsmb has no `--kdcHost`, no `--ccache-file` (`KRB5CCNAME` names the cache), no Kerberos
+  with a password or a key. Without `--kdcHost`, smbclient-ng asks the domain's name, port 88;
+  rsmb does the same when no `krb5.conf` names a KDC for the realm. Against Samba's KDC
+  smbclient-ng fails with every cache that holds only a ticket-granting ticket
+  (`KRB_AP_ERR_INAPP_CKSUM`: its TGS request carries no checksum), while rsmb logs in with one that
+  is forwardable and renewable; with the service ticket in the cache both log in.
 - `shares` always shows the access to each share, from the TREE_CONNECT answer (1 more round
   trip for the whole list). smbclient-ng shows rights only with `shares -R`: per share a tree
   connect and a listing of the root, one after another, and it reports READ or NO ACCESS (its
@@ -861,7 +1011,7 @@ Example: `rsmb --proxy socks5://127.0.0.1:1080 -H fileserver.example -u alice -d
 - `pwd` prints `//host/share/path`; `refresh` exists because listings are cached.
 - `ls` shows times in UTC, sorted by name, `/` after directories.
 - Exit codes are fixed (0, 1, 2, 3, 130); a non-interactive run stops at the first failure unless
-  `-k`; `--json` gives machine-readable output.
+  `--keep-going`; `--json` gives machine-readable output.
 - rsmb never prompts when stdin is not a terminal.
 - `get -r <dir>` keeps the structure below the named directory: `get -r /tree/d0` makes `./d0/…`.
   `put -r <dir> <remote>` puts `<dir>` into `<remote>`.

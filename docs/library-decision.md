@@ -242,7 +242,7 @@ same.
 | Listings are not compounded | 4 flights for a small directory: CREATE, QUERY_DIRECTORY, QUERY_DIRECTORY, CLOSE (step 4) | A small `ls` costs 4 round trips through the crate. **Stage 1 answer:** rsmb compounds the listing itself through `execute_compound` (shape P, section "Listing shape (Stage 1)"): 5 requests in 1 flight on Samba for any directory up to 15.9 MiB of entries, `huge/` included. |
 | The default query buffer is 64 KiB | `huge/`: 174 flights at 64 KiB, 5 at 8 MiB (step 4) | Always pass the large buffer. Memory: `huge/` peaks at +44.8 to +58.7 MB at 8 MiB against +12.0 to +12.6 MB at 64 KiB; `many/` at +4.5 to +4.8 against +1.4 MB. |
 | An unknown user mapped to guest by Samba is refused by the client | `GuestSessionRefused` (step 1) | Guest login must use the user name `Guest` (or anonymous), and the error has to tell the user so. |
-| No NT-hash login | not found in `src/auth` (step 12) | Pass-the-hash is not available; out of scope anyway. Kerberos exists and was not tested. |
+| No NT-hash login | not found in `src/auth` (step 12) | Pass-the-hash is not available; out of scope anyway. Kerberos is measured below (Stage 5). |
 | Names with DOS wildcards cannot be opened by their mangled name | 4 of the 9 names in `mangled/`: `STATUS_OBJECT_NAME_INVALID` (step 9) | A server limit (smbclient gets NOT_FOUND). rsmb lists these names and reports the error; it cannot fetch them. |
 | A download ends without an error when the file shrinks | 50 MiB truncated to 20 MiB during the download: 20,971,520 bytes, no error (Stage 2 planning) | rsmb compares the bytes received with the size at open and fails the transfer (`file_shrinks_during_get`). Growth is not detected (the download stops at the size at open). |
 | A full disk shows at `FileWriter::finish`, not at `write_chunk` | 12 MiB into `tiny` (10 MiB): every `write_chunk` succeeded, `finish` failed with `STATUS_DISK_FULL` (Stage 2 planning) | the temporary file is deleted after `finish` fails (`disk_full_tiny`). |
@@ -333,13 +333,36 @@ spikes/smb-rs/run.sh          # all steps on the pin and the patched build, abou
 spikes/smb-rs/run.sh 3 7      # only these (1 2 3 4 5 6 7 7c 8 9 10 10i 11 12 13)
 ```
 
+### Kerberos (Stage 5)
+
+Measured against a Samba 4.23.8 AD DC (Heimdal KDC, realm `RSMB.TEST`) while planning Stage 5
+(`docs/plans/stage-5.md`, section 2). **What works:** `Session::setup_kerberos_from_ccache(conn,
+creds, server_hostname, &CCache)` with a cache parsed by `parse_ccache`: with a service ticket for
+`cifs/<host>` in the cache the login is NEGOTIATE 1 and SESSION_SETUP 1 (2 requests in 2 flights,
+against NTLM's 3), with signing (AES-GMAC) and on a share with `smb encrypt = required`; with a
+ticket-granting ticket only, the crate runs one TGS exchange first. `CCache` and its entries have
+public fields, so rsmb removes entries before handing the cache over. The user and the realm must
+go to the crate exactly as the cache spells them (another case: `STATUS_LOGON_FAILURE` with a
+service ticket, `KRB_AP_ERR_BADMATCH` with a TGT).
+
+Behaviours rsmb designs around (`docs/architecture.md`, "Kerberos"):
+
+| Behaviour | Measured | Consequence |
+|---|---|---|
+| The KDC client opens its own sockets, with no hook: UDP first (3 attempts, 10 s each, 1 s and 2 s between), then TCP the same way, to `KerberosCredentials::kdc_address` | through a SOCKS5 proxy it dials the KDC directly (the KDC's log names the host's address); a closed port 88: 36.0 s, then `Io(ConnectionRefused)`; a silent KDC: 66.0 s, then `Timeout`; this KDC answers a UDP TGS request with `RESPONSE_TOO_BIG`, so every exchange costs a wasted round trip | rsmb gives the crate a loopback UDP address of its own and relays each request over TCP through its own dialer (the relay): through the proxy, 10 s, its own messages, no wasted round trip |
+| The TGS request has fixed KDC options `0x40810010` (forwardable, renewable, canonicalize, renewable-ok); `kerberos_encrypt` and `kerberos_decrypt` are `pub(crate)` | a TGT that is not forwardable (MIT `kinit` without `-f`) or not renewable (Heimdal's default) gets KRB-ERROR 13 (`KDC_ERR_BADOPTION`) from Heimdal | a documented limit with a message that names `kinit -f` and `kvno cifs/<host>`; a defect to report upstream (the options should follow the TGT's flags) |
+| `CCache::find_service_ticket` and `find_tgt` take the first match and do not look at the end time | an expired entry is used; the server answers it `STATUS_INVALID_PARAMETER` (more than five minutes past its end) or accepts it and ends the session at the next request (`SessionExpired`) | rsmb removes every entry whose end time is not after now before the crate sees the cache, and says which ticket expired |
+| `parse_ccache` allocates what the file claims: a principal that claims 4,294,967,295 name parts | `memory allocation of 103079215080 bytes failed`, exit 134 | not guarded (a guard would be a second parser); documented; to report upstream. A cache cut inside an entry is read up to the cut |
+| `load_ccache(None)` reads `KRB5CCNAME` and has no default, although its comment promises `/tmp/krb5cc_<uid>` | an error without the variable | rsmb finds the file itself (`KRB5CCNAME`, else `/tmp/krb5cc_<uid>`) and reads it with `std::fs` |
+
 `spikes/smb-rs/run.sh` clones upstream smb-rs into `target/smb-rs-src` to apply the patches, so it
 needs network access the first time.
 
 ## Not verified
 
 - Any Windows server (see `docs/known-limitations.md`).
-- `smb2`: the reconnect hooks, `set_keepalive`, Kerberos. (Stage 2 has measured what was listed
+- `smb2`: the reconnect hooks, `set_keepalive`; Kerberos against a Windows KDC or server, or an
+  MIT KDC (Stage 5 measured a Samba AD DC only). (Stage 2 has measured what was listed
   here before: `over4g.bin` down and up in full (`over_4g`, and at the slow endpoint in the bench),
   repeated transfers at the slow endpoint (`bench-rsmb.sh transfers`), an encrypted share with
   `medium.bin` each way (`edge_and_encrypted`).)

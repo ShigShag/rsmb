@@ -1,12 +1,12 @@
 # Architecture
 
-How rsmb is built: the finished program, after Stage 4 (the SOCKS5 proxy). The design is about round trips: one TCP
+How rsmb is built: the finished program, after Stage 5 (Kerberos from the ticket cache). The design is about round trips: one TCP
 connection, one tree connect per share, `cd` in one compound, a directory listing in one compound,
 cached listings for completion, nothing sent between commands, transfers that keep up to 16 small
 files or one stream window in flight, walks that keep up to 16 listings in flight. The decisions
 behind it are in [`plans/master-plan.md`](plans/master-plan.md), [`plans/stage-1.md`](plans/stage-1.md),
-[`plans/stage-2.md`](plans/stage-2.md), [`plans/stage-3.md`](plans/stage-3.md) and
-[`plans/stage-4.md`](plans/stage-4.md); this document
+[`plans/stage-2.md`](plans/stage-2.md), [`plans/stage-3.md`](plans/stage-3.md),
+[`plans/stage-4.md`](plans/stage-4.md) and [`plans/stage-5.md`](plans/stage-5.md); this document
 describes the code as it is. The rules of
 transfers, each with its test, are in [`transfers.md`](transfers.md).
 
@@ -15,7 +15,7 @@ transfers, each with its test, are in [`transfers.md`](transfers.md).
 | File | Holds |
 |---|---|
 | `src/main.rs` | `Args` (clap) and `options()` (the flags as the manual prints them), the start-up rules (password, `-S`/`-C`/stdin), the runtime, signal handling, `run_blocking`, the non-interactive runner, exit |
-| `src/session.rs` | `Target`, `Proxy`, the dialer and the transport halves, login, `Session` (connection, tree map, share, working directory, cache, kept share list, the registry of remote temporary files and the writer slot), the `cd` check and `open_close`, the listing (`plan`, the entry parser, both phases), the share list, `Cache` and its `invalidate`, reconnect, `Error`, `Kind`, `classify`, `valid_name` and `crate_path`, `Remote` (every request of a transfer, `mkdir`, `rm`, `rmdir`), `finish` and `cleanup`. **All use of `smb2` is in this file** |
+| `src/session.rs` | `Target`, `Proxy`, the dialer and the transport halves, login (NTLM, or Kerberos: the ticket cache, `krb5.conf`, the KDC relay, the Kerberos messages), `Session` (connection, tree map, share, working directory, cache, kept share list, the registry of remote temporary files and the writer slot), the `cd` check and `open_close`, the listing (`plan`, the entry parser, both phases), the share list, `Cache` and its `invalidate`, reconnect, `Error`, `Kind`, `classify`, `valid_name` and `crate_path`, `Remote` (every request of a transfer, `mkdir`, `rm`, `rmdir`), `finish` and `cleanup`. **All use of `smb2` is in this file** |
 | `src/transfer.rs` | `get`, `put`, `cat`: temporary names (`temp_name`, `is_temp_name`), `local_component`, `LocalTemp`, the target rules (`local_target`, `remote_target`), the recursive transfers, the local walk of `put -r`, `Progress` |
 | `src/walk.rs` | `walk`: the one traversal routine (16 listings in flight or waiting, results in queue order, a stop, the loop check by file id, the caps for servers without ids), generic over the function that lists a directory; `Listing`, `Dir`, `Report`. The pure parts of `tree` and `find`: `Glob`, `parse_size`, `parse_depth`, `Filter`, `draw_tree`, `end_report`, `TREE_MAX` |
 | `src/commands.rs` | `COMMANDS` (the command table), `CmdId`, `Arg`, `Args`, `run_line` (and the overwrite prompt's `Flow::Confirm`), argument and flag splitting (flags with a value), the command functions (`mkdir`, `rm`, `rmdir`, `lcd`, `lpwd`, `lls`, `tree`, `find` and their `run_walk` here; `get`, `put`, `cat` call `transfer`), `Out` (text or JSON lines, raw bytes for `cat`, item errors, `diag`, `written`), `entry_obj`, help rendering, time formatting |
@@ -67,18 +67,25 @@ walk is generic over a closure so that its unit tests can list a fake tree.
 2. Usage checks, exit 2: the `--proxy` URL (one message for every refused URL, which never
    repeats it: it may hold a password), with `--proxy` a `-H` longer than 255 bytes, an unreadable
    `-S` file, `-N` with nothing to run on a terminal.
-3. Password: `-p`; else empty for `--no-pass` or an empty user; else a prompt through `rpassword`
+3. Password: `-p`; else empty for `-k`, `--no-pass` or an empty user; else a prompt through `rpassword`
    **only if stdin is a terminal** (rpassword itself reads `/dev/tty`, so the check is on stdin);
-   else a usage error before anything touches the terminal or the network.
+   else a usage error before anything touches the terminal or the network. `-k` (Kerberos)
+   conflicts with `-p` and `--no-pass` in clap and never asks; nothing about the ticket cache is
+   checked in `main`: `login` reads it before it dials, and the same code runs on a reconnect.
 4. Runtime, signals, `Session::connect` (interruptible). A failure exits 3. In the interactive
-   shell one line on stderr (`Session::describe`, built by `banner`) names the user, the server,
-   the proxy's address when there is one (never its user or password) and the dialect.
+   shell one line on stderr (`Session::describe`, built by `banner`) names the user, ` (Kerberos)`
+   with `-k`, the server, the proxy's address when there is one (never its user or password) and
+   the dialect.
 5. `-S` lines, then `-C` lines; then the shell, or stdin lines (only when neither `-C` nor `-S`
    was given), or exit. The shell starts only when stdin is a terminal and neither `-N` nor
    `--json` was given: `--json` never starts the line editor, whose prompt and echo would go to
    stdout, so lines typed at a terminal under `--json` go through the stdin loop with its rules
-   (the first failure ends the run unless `-k`, Ctrl-C exits 130). `docs/scripting.md` has the
-   rules.
+   (the first failure ends the run unless `--keep-going`, Ctrl-C exits 130). `docs/scripting.md`
+   has the rules.
+
+Environment variables read: `RSMB_HISTORY`, `XDG_STATE_HOME` and `HOME` (the history file), and
+with `-k` `KRB5CCNAME` (the cache) and `KRB5_CONFIG` (where the KDC is named). Nothing else:
+no proxy variable, nothing of the system's Kerberos library (rsmb does not link one).
 
 ## Session
 
@@ -132,7 +139,79 @@ with user, password and domain. 3 requests. Guest is the user `Guest` with an em
 anonymous the empty user. When the server answers a named login with a guest session (Samba maps
 unknown users to guest), the crate refuses it (`GuestSessionRefused`) and rsmb says to use
 `-u Guest --no-pass`. The keepalive stays at the crate's default (it only probes while a request
-is outstanding, so an idle session sends nothing).
+is outstanding, so an idle session sends nothing). `login` returns the connection and, with
+Kerberos, who the cache says we are.
+
+### Kerberos (`-k`)
+
+`login` branches on `target.kerberos`, the same code at start-up and on every reconnect:
+
+1. **`read_ticket`, before the dial** (a cache that cannot be used costs no connection):
+   `ccache_path(var_os("KRB5CCNAME"), getuid())` (taken as bytes, so a name that is not UTF-8 is
+   the variable's; `FILE:<path>` or a path; unset or empty `/tmp/krb5cc_<uid>`, flagged as the
+   default; another type is an error naming it), `open_regular` (opens with `O_NONBLOCK`, so a
+   FIFO does not wait for a writer, a wait that the signal branch of `interruptible` could not end,
+   and refuses what `fstat` says is not a regular file), the owner check on the same opened file
+   (`fstat` uid against `getuid`, so check and read see the same file; `cache_owner`),
+   `read_to_end`, the crate's `parse_ccache`, then `pick_ticket` with
+   the clock.
+2. **`pick_ticket`** (pure, unit-tested): the default principal must have one name part; `-u` and
+   `-d`, if set, must equal user and realm without ASCII case; the candidates are the entries the
+   crate's own lookup would take (`cifs/<host>@<realm>`, `krbtgt/<realm>@<realm>`), and the latest
+   end among the expired ones is remembered; then **every entry whose end time is not after now is
+   removed** (the crate takes the first match whether it has expired or not, and the server
+   answers an expired ticket with `STATUS_INVALID_PARAMETER`, or accepts a just-expired one and
+   ends the session at once); then a service ticket for `cifs/<-H>`, else a TGT, else an error
+   (expired with the time, or no ticket). The messages for the default file carry a hint that
+   `KRB5CCNAME` was not set.
+3. **`Session::connect` pins the principal**: after the first login `target.user` and
+   `target.domain` are the cache's user and realm, so a reconnect that finds another principal in
+   the cache fails `pick_ticket`'s match and names both.
+4. **`kerberos_setup`**: NEGOTIATE as for NTLM, then `smb2::Session::setup_kerberos_from_ccache`
+   with the user and realm as the cache spells them (the crate needs that spelling) and SPN
+   `cifs/<-H as given>`. With the service ticket in the cache the crate builds the AP-REQ at once:
+   1 SESSION_SETUP, no KDC. With a TGT only the crate runs a TGS exchange with
+   `KerberosCredentials::kdc_address`.
+5. **The relay.** The crate's KDC client opens its own sockets (UDP first: 3 attempts of 10 s,
+   then TCP the same way), with no hook: left alone it would dial around the proxy, take 36 s for
+   a closed port and 66 s for a silent KDC, and report both as a lost connection. So the crate is
+   always given **a loopback address of ours** as the KDC: a `UdpSocket` on `127.0.0.1:0`, open
+   only while that login runs. `kdc_relay` takes each datagram the first sender (the crate's
+   socket) sends there and ignores every other address (so another local process cannot make
+   rsmb dial the KDC through the user's proxy with its credentials, or read an answer), dials the
+   KDC with **`open_tcp`** (so `TCP_NODELAY`, through the proxy with its login when there is one,
+   the KDC's name resolved by the proxy, never around it), writes the 4-byte length and the
+   request in one write, reads the answer and sends it back as a datagram. Because the relay *is*
+   the crate's UDP peer, the crate's UDP-first costs nothing and its fallback to TCP never runs.
+   `kerberos_setup` runs the relay beside the setup in a `biased` `select!`: the relay returns
+   only its error, so the login ends exactly when the KDC exchange failed. **One timer at a
+   time**: `open_tcp` has the 10 s (`DIAL_TIMEOUT`) and reports in its own words; what is left of
+   the 10 s bounds the write and the read (`connected to the KDC, but it did not answer within
+   10 s`), so the same silence always gives the same message. An answer that is a KRB-ERROR (it
+   starts `0x7e` and parses with the crate's `parse_krb_error`) is not handed on: `kdc_error`
+   words it, and the login ends. A new TCP connection per datagram (the crate sends one, or the
+   same again after its own 10 s). The crate's own socket is another matter: it binds
+   `0.0.0.0:0` and takes the first datagram from anyone (`smb2` `kdc.rs`, `send_udp`), so during
+   the TGT-only login that socket listens on every interface on an ephemeral port; see
+   `docs/known-limitations.md`.
+6. **`kdc_for`**: the KDC is the first `kdc` of the realm in the first of `krb5_files(KRB5_CONFIG)`
+   that names one (`krb5_kdc` counts braces, so a `kdc` in a nested block or another realm's block
+   is not taken; `[v6]:port`, a bare IPv6 address, `host:port`, `tcp/` and `udp/` prefixes;
+   `http` KDCs skipped; a file that is not a regular file counts as unreadable: absent), else the
+   realm's own name in lower case, port 88. The environment is read
+   in `kerberos_setup` only, so both functions are tested without it.
+7. **Errors.** `kerberos_refusal` turns the crate's error from the setup into ours: a lost
+   connection as `classify` says; an error with a status that `classify` calls `auth` keeps
+   `login refused`; any other status is `the server did not accept the ticket (<status>)`; no
+   status means the crate raised it itself (an unknown encryption type, a ticket or a KDC answer
+   it cannot parse or decrypt, a signature that fails) and reads `could not be used`. Every
+   Kerberos message starts `Kerberos: `; kind `auth` for the cache and for refusals, `connect` for
+   a KDC that could not be asked (the dial, silence, a closed connection). The tables are in
+   `commands.md`, "Kerberos".
+
+rsmb writes no cache and keeps no service ticket it obtained: every TGT-only login asks the KDC
+once. No new dependency: the crate does the Kerberos, `libc::getuid` and tokio's UDP socket the
+rest.
 
 ### Tree map and the rule "every method that sends starts with `tree()`"
 
@@ -295,13 +374,19 @@ connection shows as an error in each answer of the compound, not as an error of 
   that keeps arriving is not silence (the receive half reports its progress), but the crate
   extends one request's deadline to at most 6 × `--timeout`, so **one reply must be complete
   within 6 × `--timeout`** (180 s by default). Connecting has its own 10 s (`DIAL_TIMEOUT`, the
-  whole dial, through a proxy too).
+  whole dial, through a proxy too), and so does the KDC exchange of a Kerberos login with a TGT
+  (the relay's dial, then what is left of the 10 s for the request and the answer).
+- **A Kerberos session ends with its ticket.** The server then answers every request
+  `STATUS_NETWORK_SESSION_EXPIRED`, which the crate reports as `SessionExpired`; `classify` makes
+  it `connection_lost` (`the server ended the session (with -k: the ticket's lifetime is over)`),
+  and the ordinary path follows: the connection is marked dead, a reading command runs once more,
+  and that login reads the cache again. Nothing re-authenticates a session in place.
 - **No probe.** A dead connection is known when the crate's receiver task saw it close
   (`is_disconnected()`) or when a request failed.
 - **`ensure_connected`** (only from `tree()`): if the connection is disconnected, log in again
   (the same `login` as at start-up) and empty the tree map. Share, working directory, cache and
   share list stay. A failed reconnect keeps the kind of its cause (`connect` when nothing answers, `auth`
-  when the login is refused, …; message `reconnect failed: …`) and leaves the dead connection in
+  when the login is refused or the ticket cache cannot be used, …; message `reconnect failed: …`) and leaves the dead connection in
   place, so the next command that sends tries again.
 - **`mark_dead`** (`conn.mark_dead()`) is called in three places, each before anything else is
   sent: by `run_parsed` when a command returned `connection_lost` (the crate reports that kind also
@@ -348,7 +433,9 @@ removed), printed as `path` and `left_behind`. `classify(e, what)` maps the crat
 (and first the statuses `DIRECTORY_NOT_EMPTY` → `not_empty`, `CANNOT_DELETE` → `other`; a sharing
 violation is `other`, "in use by another client"); a response frame with an error status is turned
 into the crate's `Protocol` error first, so there is one mapping. Messages read `<what>: <reason>` (`/nope: not
-found`, `share 'nope': not found`); a lost connection reads `connection lost: …`.
+found`, `share 'nope': not found`); a lost connection reads `connection lost: …`. A Kerberos
+failure is not classified: it is built where it happens (the cache, the relay, `kerberos_refusal`),
+starts `Kerberos: ` and is `auth` or `connect` (no kind of its own).
 
 Exit codes: `usage` 2, `interrupted` 130, any other error 3 at start-up and 1 later.
 
@@ -374,13 +461,13 @@ asks `Overwrite? [y/N]` with history off for that line and, on `y`, runs the lin
 
 `Out` writes text or JSON lines to a buffered stdout and remembers the first write error; `done`
 flushes, and a failed write turns the line's result into `local_io`; `run_blocking` then ends the
-run with exit 1 whatever `-k` says (`Out::broken`). Nothing uses
+run with exit 1 whatever `--keep-going` says (`Out::broken`). Nothing uses
 `println!` (it panics on a closed pipe). In text mode errors go to stderr as `rsmb: <message>`,
 after stdout has been flushed. **Everything text mode prints that holds a name or a message goes
 through `safe`** (`src/session.rs`): `Out::text` (one line, escaped), `Out::diag` and the text
 branch of `Out::error`, the progress line, the prompt, the overwrite question and the Tab
 candidate `display`; control and bidi characters become `\u{..}`. `--json` never calls it.
-`Out::doc` is the same without it, for the manual and the help (our own text, several lines). `Out::raw` writes `cat`'s bytes as they are; `Out::begin` remembers
+`Out::doc` is the same without it, for the manual and the help (our own text, several lines), and wraps each line at spaces to 80 columns, a continuation under the line's second column (`wrap`); `--json` is never wrapped. `Out::raw` writes `cat`'s bytes as they are; `Out::begin` remembers
 the line being run, so `Out::item_error` can print an error about one item of a recursive transfer
 with its `command`; `transfer` and `summary` lines are flushed as they are written. `Out::diag`
 writes a note on stderr (`rsmb: …`, stdout flushed first) in text mode and nothing with `--json`,

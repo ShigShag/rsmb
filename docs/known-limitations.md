@@ -1,6 +1,6 @@
 # Known limitations
 
-What rsmb does not do, does differently, or was not tested, for the finished program (all four
+What rsmb does not do, does differently, or was not tested, for the finished program (all five
 stages): the client's own limits by topic, the scope, the server tested against, the library
 (`smb2` 0.43.0, `docs/library-decision.md`) and the test environment. The rules of transfers are
 in [`transfers.md`](transfers.md), the proxy's behaviour in [`commands.md`](commands.md), "Proxy".
@@ -106,6 +106,8 @@ recorded in `docs/plans/stage-4.md`, "Deviations during implementation".
 - With `--proxy`, `-H` is at most 255 bytes (a SOCKS5 request carries no longer name). An IPv6
   server is given without brackets (`-H ::1`); brackets around `-H` are not stripped (`-H
   '[::1]'` goes to the proxy as the name `[::1]` and fails).
+- **Every connection goes through the proxy, the KDC's of a Kerberos login included** (by name,
+  resolved by the proxy).
 - **No fallback**: a proxy that cannot be reached is the command's error even when the server
   could be reached directly (tested with a closed proxy port and with the proxy gone mid-session;
   a proxy that goes silent while the server is reachable directly was not tried, the code path is
@@ -172,7 +174,7 @@ recorded in `docs/plans/stage-4.md`, "Deviations during implementation".
   wide characters at the end of a line and terminal multiplexers were not tried.
 - `ls` of 100,000 lines through a terminal was not timed (the pty tests interrupt it).
 - `--json` never starts the line editor: lines typed at a terminal under `--json` follow the
-  rules of a non-interactive run (the first failure ends it unless `-k`, no prompt, no history,
+  rules of a non-interactive run (the first failure ends it unless `--keep-going`, no prompt, no history,
   no completion).
 
 ## Transfers
@@ -310,11 +312,85 @@ recorded in `docs/plans/stage-4.md`, "Deviations during implementation".
   listing. A silent link during a walk is not tested (the path is the one tested for `ls`).
 - No `-mindepth` (not built until someone asks).
 
+## Kerberos (`-k`)
+
+- **A ticket cache file only.** `KRB5CCNAME` as `FILE:<path>` or a path, else
+  `/tmp/krb5cc_<uid>`; `KCM:`, `KEYRING:`, `DIR:`, `MEMORY:` and `API:` caches are not read, and
+  `default_ccache_name` of `krb5.conf` is not read (a host configured for KCM gets the message
+  for the missing default file, which says so). No Kerberos with a password, a key or a
+  certificate (PKINIT); no flag for the KDC or the cache.
+- **`-k` changed its meaning**: it used to be the short form of `--keep-going`. An old command line
+  with `-k` and `-p` or `--no-pass` is refused (exit 2); one without either is now a Kerberos login
+  as the principal of the default cache, which succeeds when that cache is usable.
+- **The service name is `cifs/<-H as given>`**: no canonical name, no reverse lookup. `-H` must be
+  the server's name in the realm; an address needs a ticket or a service name for that address,
+  a short name or a DNS alias is another service name.
+- **A TGT-only login needs a forwardable and renewable ticket-granting ticket.** The crate asks
+  for a forwardable, renewable service ticket (its options are fixed), and a KDC that follows
+  RFC 4120, as Samba's Heimdal does, refuses that (`KDC_ERR_BADOPTION`) for a TGT that is not
+  both: MIT `kinit` without `-f` where `krb5.conf` does not set `forwardable = true`, and Heimdal's
+  `kinit` by default (forwardable, not renewable). The two ways out are named in the message:
+  `kinit -f` (with `-r` where needed), or the service ticket in the cache (`kvno cifs/<host>`).
+  smbclient-ng (impacket) sends the same options. Lifting this would mean a TGS request built by
+  rsmb itself, a second Kerberos implementation (decision K2 of `docs/plans/stage-5.md`); a
+  Windows KDC was not tried.
+- **One KDC**: the first `kdc` of the realm in the files of `KRB5_CONFIG` (else `/etc/krb5.conf`),
+  else the realm's own name in lower case, port 88. No DNS SRV lookup, no `include` or
+  `includedir`, no realm written on one line with its braces, no second KDC when the first fails,
+  no tickets across realms. The realm's name as the KDC is right for Active Directory (a domain's
+  name resolves to its domain controllers) and wrong for a realm whose name is not a host: then a
+  `krb5.conf` of one's own in `KRB5_CONFIG` is needed (the message says how).
+- **No service ticket is kept**: rsmb never writes the cache, so every login with only a TGT asks
+  the KDC once, and that is one TCP connect and one exchange more than needed (5 round trips
+  against 3 with the service ticket in the cache). The KDC connection is opened when the crate
+  asks for it, after NEGOTIATE, not beside the SMB dial.
+- **10 s for the KDC**, fixed, like the dial.
+- **Expiry by this host's clock with no allowance**, while a server allows five minutes of clock
+  difference: rsmb refuses a ticket a server might still take. **A session ends with its ticket**
+  and is replaced by a new login, not re-authenticated in place: a reading command running at
+  that moment is run again on the new login, which reads the cache again (it works with new
+  tickets; with the old ones it fails with kind `auth`, `reconnect failed: Kerberos: the ticket
+  for … expired at …; run kinit`); any other command fails with `connection_lost` (a transfer
+  too, as on any lost connection) and is not run again, and the next one logs in again from the
+  cache. Reproduced with 130 s tickets, each command 150 s after they were made: a fresh cache
+  and `ls /` ok; the old cache and `ls /` `auth`; a fresh cache and `mkdir` `connection_lost`. A session outliving its ticket was measured by hand while planning
+  (the shortest ticket this KDC issues for a service is 121 s), not in the gate.
+- **The loopback UDP socket.** During a TGT-only login rsmb holds a UDP socket on `127.0.0.1` (a
+  port the kernel picks); the first sender's datagrams are forwarded to the KDC, every other
+  address is ignored, and an answer is only of use to the login if it decrypts with the TGT's
+  session key. It is closed when the login ends. A local process that writes there first gets
+  no answer and the crate's request is ignored, so that one login fails (a denial, nothing more).
+- **The crate's own UDP socket listens on every interface** (`smb2` 0.43.0, `kdc.rs` `send_udp`
+  binds `0.0.0.0:0` and takes the first datagram from any sender). During a login with only a
+  TGT, from the crate's send to the answer (milliseconds, with retries up to 10 s for a silent
+  relay), that port, which the kernel picks, is open to the network: a stray or forged datagram
+  can end that login with an `auth` error (`the ticket in the cache or the KDC's answer could
+  not be used`, exit 3; measured: one datagram `30 00` from another host, login ended after
+  1566 ms). It cannot make a login succeed: an answer is only of use if it decrypts with the
+  session key from the cache. rsmb cannot change the crate's socket; a login with the service
+  ticket in the cache (`kvno cifs/<host>`) opens none.
+- **A cache or a `krb5.conf` that is not a regular file** is refused (the cache: `auth`, `not a
+  regular file`) or, for the files of `KRB5_CONFIG`, taken as absent, before anything is read: a
+  FIFO has no writer and would hang rsmb in `open`, where a signal cannot end it.
+- **A cache owned by another user is refused**, root's use of a user's cache included (copy it);
+  a file system that reports another owner for the user's own files (some network mounts) is
+  refused too.
+- **A cache file that triggers the crate's allocation ends the process**: a principal that claims
+  billions of name parts makes `parse_ccache` ask for an absurd allocation, and the process aborts
+  with exit 134 and the allocator's line on stderr, **without an `error` object, under `--json`
+  too**. A guard would be a second cache parser (decision K13). A cache cut inside an entry is
+  read up to the cut.
+- **Tested against Samba's Heimdal KDC only** (Samba 4.23.8 AD DC): no Windows KDC or server, no
+  MIT KDC, no cache written by impacket (impacket 0.13.0 could not make one against this KDC).
+  The round trips of a Kerberos login are counted, not timed at a slow link. That nothing goes
+  around the proxy rests on the KDC's log naming each request's source address, with a control
+  that shows a direct request as such.
+
 ## Out of scope (from `docs/brief.md`)
 
-Kerberos, ACL display, the module system, several simultaneous sessions, mount, and the remaining
-smbclient-ng commands. Authentication covers user/password/domain, guest and anonymous; other
-methods are out of scope. NT-hash login does not exist in `smb2`.
+ACL display, the module system, several simultaneous sessions, mount, and the remaining
+smbclient-ng commands. Authentication covers user/password/domain, guest, anonymous and Kerberos
+from a ticket cache; other methods are out of scope. NT-hash login does not exist in `smb2`.
 
 ## What Samba does with odd names
 
@@ -350,6 +426,12 @@ around":
   (limit above; 306 shares fit).
 - The crate publishes a breaking 0.x release every few days. rsmb pins `=0.43.0`, so fixes upstream
   arrive only through a deliberate upgrade.
+- Kerberos: the crate's KDC client dials by itself (UDP first, 36 s for a closed port, 66 s for a
+  silent KDC, around any proxy); its TGS request has fixed options (forwardable, renewable); its
+  cache lookup takes an expired entry; its cache parser can be made to abort the process;
+  `load_ccache(None)` has no default file; its UDP socket for the KDC listens on every interface
+  and takes the first datagram from anyone (above). rsmb works around the first three (the relay,
+  the expiry check) and documents the rest (above).
 
 ## Test environment and measurements
 

@@ -620,6 +620,51 @@ pub fn positional_index(cmd: &Cmd, finished: &[String]) -> Option<usize> {
 // ---------------------------------------------------------------------------------------------
 // Output
 
+/// The manual's text is wrapped to this many columns (`--json` keeps every string whole).
+pub const WIDTH: usize = 80;
+
+/// One line of the manual, broken at spaces to `WIDTH` columns. A continuation starts under the
+/// text after the line's first gap of two or more spaces (a flag's help, a command's summary)
+/// when that is in the left half, else under the line's indent. A word longer than a line stays
+/// whole.
+fn wrap(line: &str) -> String {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let hang = line[indent..]
+        .find("  ")
+        .map(|i| indent + i + 2)
+        .map(|g| g + line[g..].len() - line[g..].trim_start_matches(' ').len())
+        .filter(|&h| h < line.len() && line[..h].chars().count() <= WIDTH / 2)
+        .unwrap_or(indent);
+    let pad = " ".repeat(line[..hang].chars().count());
+    let (mut out, mut rest, mut lead, mut keep) = (String::new(), line, "", hang);
+    loop {
+        let room = WIDTH - lead.len();
+        let Some((limit, _)) = rest.char_indices().nth(room) else {
+            break;
+        };
+        // the last space that fits, else the first after a word too long for the line
+        let fits = if rest[limit..].starts_with(' ') {
+            Some(limit)
+        } else {
+            rest[..limit].rfind(' ')
+        };
+        let Some(cut) = fits
+            .filter(|&c| c > keep)
+            .or_else(|| rest[limit..].find(' ').map(|i| limit + i))
+        else {
+            break;
+        };
+        out.push_str(lead);
+        out.push_str(rest[..cut].trim_end());
+        out.push('\n');
+        rest = rest[cut..].trim_start();
+        (lead, keep) = (&pad, 0);
+    }
+    out.push_str(lead);
+    out.push_str(rest);
+    out
+}
+
 /// stdout, as text or as one JSON object per line. Remembers the first write error.
 pub struct Out {
     pub json: bool,
@@ -669,7 +714,8 @@ impl Out {
     /// Text mode, our own fixed text, possibly several lines (the manual): written as it is.
     pub fn doc(&mut self, text: &str) {
         if !self.json {
-            self.write(text);
+            let lines: Vec<String> = text.split('\n').map(wrap).collect();
+            self.write(&lines.join("\n"));
         }
     }
 
@@ -1524,7 +1570,7 @@ pub const EXIT_CODES: &[(u8, &str)] = &[
     ),
     (
         1,
-        "a command failed (the first failure stops a non-interactive run unless -k)",
+        "a command failed (the first failure stops a non-interactive run unless --keep-going)",
     ),
     (
         2,
@@ -1533,7 +1579,7 @@ pub const EXIT_CODES: &[(u8, &str)] = &[
     ),
     (
         3,
-        "connecting or logging in failed at start-up, a proxy failure included",
+        "connecting or logging in failed at start-up, a proxy or Kerberos failure included",
     ),
     (
         130,
@@ -1552,12 +1598,13 @@ stdin is a terminal and -N is absent, the interactive shell starts; if stdin is 
 and neither -C nor -S was given, commands are read from stdin, one per line, until end of input; \
 otherwise rsmb exits. With -C or -S stdin is never read. Blank lines and lines whose first \
 non-blank character is # are skipped. A non-interactive run stops at the first failing command \
-with its exit code; with -k (--keep-going) it goes on and exits with the code of the first \
-failure. If stdout cannot be written (the reader closed the pipe) the run ends at once with exit \
-code 1, also with -k. rsmb never prompts when stdin is not a terminal: a missing password is a \
-usage error (give -p or --no-pass). With --json the line editor never starts: lines typed at a \
+with its exit code; with --keep-going it goes on and exits with the code of the first failure. \
+If stdout cannot be written (the reader closed the pipe) the run ends at once with exit code 1, \
+also with --keep-going. rsmb never prompts when stdin is not a terminal: a missing password is a \
+usage error (give -p or --no-pass, or log in with -k from the ticket cache, which never asks). With --json the line editor never starts: lines typed at a \
 terminal are read one by one like lines from a pipe, under the same rules (the first failing \
-command ends the run unless -k; Ctrl-C during a command ends the run with 130 after the cleanup, \
+command ends the run unless --keep-going; Ctrl-C during a command ends the run with 130 after the \
+cleanup, \
 Ctrl-C between commands exits 130; nothing asks to overwrite)."
         .to_string()
 }
@@ -1642,7 +1689,8 @@ The examples of get, put, mkdir, rm and rmdir are written for a remote working d
 write to that holds a file old.txt and an empty directory olddir, and a local working directory \
 that holds notes.txt and a directory photos; those of lcd and lls for the same local directory.\n\
 Through a SOCKS5 proxy: rsmb --proxy socks5://127.0.0.1:1080 -H fileserver.example -u alice -d \
-CORP -N -C 'use docs' -C 'ls'"
+CORP -N -C 'use docs' -C 'ls'\n\
+Kerberos: kinit -f alice@CORP.EXAMPLE; rsmb -k -H fs1.corp.example -N -C 'use docs' -C 'ls'"
         .to_string()
 }
 
@@ -1673,6 +1721,38 @@ login), once per connection; every command sends the same requests in the same r
 direct. A proxy that holds back small segments (Nagle's algorithm on its socket to the server, \
 as microsocks does) delays what has many requests in flight: walks, many small files, large \
 transfers."
+        .to_string()
+}
+
+fn topic_kerberos() -> String {
+    "-k (--kerberos) logs in with Kerberos from the ticket cache and never asks for a password; it \
+cannot be combined with -p or --no-pass. -k used to be the short form of --keep-going: an old \
+command line with -k and -p or --no-pass is now refused (exit 2), one without either is now a \
+Kerberos login. The cache is the file KRB5CCNAME names (FILE:<path> or a path), else \
+/tmp/krb5cc_<uid>; other cache types (KCM:, KEYRING:, DIR:, MEMORY:, API:) are not read: put the \
+tickets into a file with kinit -c <file> and set KRB5CCNAME to it. The file must belong to the \
+user rsmb runs as. User and realm are the cache's default principal; -u and -d are optional and, \
+if given, must match it without regard to case (-d is the realm, not a NetBIOS domain). The \
+ticket is for cifs/<-H as given>, so -H must be the server's name in the realm (an address needs \
+a ticket or an SPN for that address). With that service ticket in the cache no KDC is asked and \
+the login is 2 requests (kvno cifs/<host> puts it there). With a ticket-granting ticket only, \
+rsmb asks the KDC once per login, over TCP port 88, 10 s at most for the whole exchange; the KDC \
+is the realm's kdc in the files of KRB5_CONFIG, or in /etc/krb5.conf when that is not set, else \
+the realm's own name in lower case (corp.example:88), as a domain's name resolves to its \
+domain controllers. To name another KDC write a krb5.conf of your own with [realms], <REALM> = \
+{, kdc = <host>, } and set KRB5_CONFIG to it. That ticket-granting ticket must be forwardable and \
+renewable (kinit -f): a KDC that enforces it refuses otherwise (KDC_ERR_BADOPTION). Through \
+--proxy the KDC is reached through the proxy, by name, and nothing goes around it. A ticket whose \
+end time has passed (this host's clock) is refused by rsmb, with its end time. A Kerberos failure \
+is one line that starts 'Kerberos: ', of kind auth (the cache, a refusal by the KDC or by the \
+server) or connect (the KDC could not be asked: refused, silent for 10 s, closed, or the proxy \
+could not reach it); exit 3 at start-up, 1 when a reconnect fails ('reconnect failed: \
+Kerberos: ...'). A session ends when its ticket does. A reading command is then run \
+again on a new login, which reads the cache again: with new tickets in the cache it just works, \
+with the old ones it fails with kind auth ('reconnect failed: Kerberos: the ticket ... expired \
+at ...; run kinit'). A command that changes something (mkdir, put, rm ...) fails with \
+connection_lost and is not run again; the next command logs in again. rsmb never writes the \
+cache, keeps no service ticket it obtained, and never falls back to a password."
         .to_string()
 }
 
@@ -1719,6 +1799,7 @@ fn topics() -> Vec<(&'static str, String)> {
         ("transfers", topic_transfers()),
         ("timeouts and reconnect", topic_timeouts()),
         ("proxy", topic_proxy()),
+        ("kerberos", topic_kerberos()),
         ("tree and find", topic_tree_and_find()),
         ("examples", topic_examples()),
     ]
@@ -1772,13 +1853,16 @@ pub fn help_all(out: &mut Out) {
     out.obj(&json!({"type": "topic", "name": topics[0].0, "text": topics[0].1}));
     // 2. synopsis and start-up flags, from clap's metadata
     out.doc("\nSYNOPSIS");
-    out.doc("    rsmb -H <host> [-P <port>] [-u <user>] [-d <domain>] [-p <password> | --no-pass]");
+    out.doc(
+        "    rsmb -H <host> [-P <port>] [-k] [-u <user>] [-d <domain>] [-p <password> | --no-pass]",
+    );
     out.doc("         [--proxy socks5://[user:pass@]host:port] [--timeout <seconds>]");
-    out.doc("         [-S <file>] [-C <command>]... [-N] [-k] [--json]");
+    out.doc("         [-S <file>] [-C <command>]... [-N] [--keep-going] [--json]");
+    out.doc("    -k excludes -p and --no-pass; -u and -d may be given with it and must match the cache.");
     out.doc("    rsmb --help-all [--json]");
     out.doc("\nSTART-UP FLAGS");
     for (flag, help) in &options {
-        out.doc(&format!("    {flag:<32} {help}"));
+        out.doc(&format!("    {flag:<28} {help}"));
         out.obj(&json!({"type": "option", "flag": flag, "help": help}));
     }
     // 3, 4
@@ -1802,7 +1886,8 @@ pub fn help_all(out: &mut Out) {
          start-up prints one 'error' and no 'done'; skipped lines print nothing. A flag error is one \
          'error' of kind usage (exit 2). --json never starts the line editor: with a terminal on \
          stdin lines are read from it one by one, under the rules of a non-interactive run (the \
-         first failing command ends the run unless -k; Ctrl-C during a command ends it with 130).",
+         first failing command ends the run unless --keep-going; Ctrl-C during a command ends it \
+         with 130).",
     );
     for (name, fields) in JSON_OBJECTS {
         out.doc(&format!("    {name:<12} {fields}"));
@@ -2023,19 +2108,81 @@ pub mod tests {
         String::from_utf8(cap.0.borrow().clone()).unwrap()
     }
 
+    /// Runs of white space as one space: what a text is once the manual's wrapping is undone.
+    pub fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn manual_fits_80_columns() {
+        let text = rendered(false);
+        for line in text.lines() {
+            assert!(
+                line.chars().count() <= WIDTH || !line.trim_start().contains(' '),
+                "{line}"
+            );
+        }
+        let json = rendered(true);
+        assert!(
+            json.lines().any(|l| l.chars().count() > WIDTH),
+            "--json is not wrapped"
+        );
+        let long = "    -x, --example <VALUE>            Some help that is long enough to wrap \
+                    twice because it goes on and on, well past the eightieth column, and on";
+        let w = wrap(long);
+        assert_eq!(squash(&w), squash(long));
+        let pad = " ".repeat(long.find("Some").unwrap());
+        for l in w.lines().skip(1) {
+            assert!(
+                l.starts_with(&pad) && !l[pad.len()..].starts_with(' '),
+                "{w}"
+            );
+        }
+        assert_eq!(wrap("short line"), "short line");
+        assert_eq!(
+            wrap(&"x".repeat(100)),
+            "x".repeat(100),
+            "one word stays whole"
+        );
+    }
+
     #[test]
     fn help_all_has_everything() {
-        let s = rendered(false);
+        let s = squash(&rendered(false));
         for c in COMMANDS {
-            assert!(s.contains(c.syntax), "{}", c.syntax);
+            assert!(s.contains(&squash(c.syntax)), "{}", c.syntax);
             for (l, _) in c.examples {
-                assert!(s.contains(l), "{l}");
+                assert!(s.contains(&squash(l)), "{l}");
             }
         }
         for (name, text) in topics() {
-            assert!(s.contains(&text), "topic {name}");
+            assert!(s.contains(&squash(&text)), "topic {name}");
         }
-        assert_eq!(topics().len(), 8, "parts 1, 3, 4, 8 to 12 are topics");
+        assert_eq!(topics().len(), 9, "parts 1, 3, 4, 8 to 13 are topics");
+        let k = topic_kerberos();
+        for w in [
+            "KRB5CCNAME",
+            "kvno cifs/",
+            "kinit -f",
+            "through the proxy",
+            "the realm's own name",
+            "used to be the short form of --keep-going",
+            "never falls back to a password",
+            "A reading command is then run again",
+            "is not run again; the next command logs in again",
+        ] {
+            assert!(k.contains(w), "kerberos topic: {w}");
+        }
+        assert!(
+            !k.contains("the next command fails with connection_lost"),
+            "the old sentence about the end of a ticket"
+        );
+        assert!(s.contains(
+            "Kerberos: kinit -f alice@CORP.EXAMPLE; rsmb -k -H fs1.corp.example -N -C 'use docs' -C \
+             'ls'"
+        ));
+        assert!(!s.contains("unless -k") && !s.contains("-k (--keep-going)"));
+        assert!(s.contains("[-k] [-u <user>]") && s.contains("[--keep-going]"));
         assert!(topic_proxy().contains("never a reason to connect directly"));
         assert!(s.contains(
             "rsmb --proxy socks5://127.0.0.1:1080 -H fileserver.example -u alice -d CORP -N -C \
@@ -2062,13 +2209,15 @@ pub mod tests {
             "TRANSFERS",
             "TIMEOUTS AND RECONNECT",
             "PROXY",
+            "KERBEROS",
             "TREE AND FIND",
             "EXAMPLES",
         ] {
             assert!(s.contains(part), "{part}");
         }
+        let raw = rendered(false);
         for code in ["0 ", "1 ", "2 ", "3 ", "130 "] {
-            assert!(s.contains(&format!("    {code}")), "exit code {code}");
+            assert!(raw.contains(&format!("\n    {code}")), "exit code {code}");
         }
         for t in [
             "share",
@@ -2091,7 +2240,7 @@ pub mod tests {
             "walk_summary",
         ] {
             assert!(JSON_OBJECTS.iter().any(|(n, _)| *n == t), "{t}");
-            assert!(s.contains(&format!("    {t} ")), "json type {t}");
+            assert!(raw.contains(&format!("\n    {t} ")), "json type {t}");
         }
         for k in KIND_NAMES {
             assert!(s.contains(k), "{k}");
@@ -2100,7 +2249,7 @@ pub mod tests {
             "-S",
             "-C",
             "-N",
-            "-k",
+            "-k, --kerberos",
             "stdin",
             "#",
             "--timeout",

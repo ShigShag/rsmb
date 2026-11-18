@@ -43,6 +43,7 @@ Samba 4.23.8; slow = 100 ms each way (200 ms round trip), fast = direct. Measure
 | a second Tab in the same directory costs 0 requests (brief) | first Tab one listing, second Tab 0, Tab after `ls` 0 | 5 / 1, then 0, 0 (`many/`, `huge/`, slow) | `completion_costs_slow`, `completion_costs` |
 | report `cd` and `ls` times at 100 ms (brief) | table below | below | `bench-rsmb.sh`, `timing_*` |
 | start-up | NEGOTIATE + 2 SESSION_SETUP, nothing else | 3 requests in 3 flights | `startup_is_three_requests`, `startup_and_use_slow` |
+| start-up with `-k` (Kerberos) | NEGOTIATE + 1 SESSION_SETUP | 2 requests in 2 flights, with the service ticket in the cache and (direct) with a TGT only; the KDC asked once per login with a TGT only, 0 times with the service ticket | `kerberos_login`, `kerberos_kdc_is_asked_through_the_proxy` |
 | `use share` | 1 the first time, 0 after | 1 / 0 | `use_once_per_share` |
 | `cd /`, `cd ..`, `pwd`, `help`, `refresh` | 0 requests | 0 | `free_commands_send_nothing` |
 | `ls` small, slow | ≤ f = 1 flight | 5 requests, 1 flight | `ls_small_slow` |
@@ -399,6 +400,7 @@ encrypted DNS would blind it); the gate's proof is `no_way_around_the_proxy`.
 | What | Cost |
 |---|---|
 | start-up (connect, NEGOTIATE, SESSION_SETUP × 2) | 3 requests in 3 flights, about 0.8 s at the slow endpoint; 1.2 s on wan-bad |
+| start-up with `-k` (Kerberos) | 2 requests (NEGOTIATE, 1 SESSION_SETUP) in 2 flights: with the service ticket in the cache 3 round trips with the TCP connect (NTLM: 4); with a TGT only, plus a TCP connect to the KDC and one exchange, 5 round trips. Counted from the messages, not timed at the slow endpoint (the DC has no latency in front of it). At the fast endpoint, while planning: the Kerberos step 4.7–6.6 ms with a service ticket, 9.7–10.9 ms with a TGT through the relay (12.9–13.4 ms with the crate's own UDP-then-TCP client) |
 | `shares` | the list: 7 requests in 7 flights the first time on a connection (TREE_CONNECT `IPC$`, CREATE, 2 WRITE, 2 READ, CLOSE), 6 after; 306 shares on edge in one answer. The access column: a TREE_CONNECT and a TREE_DISCONNECT per share, up to 16 shares per compound, as many compounds in flight as the credits pay for. Table below |
 | reconnect after a cut | 4 round trips (dial, NEGOTIATE, 2 SESSION_SETUP) plus 1 TREE_CONNECT on the next use of the share |
 | first Tab in an uncached directory | one listing (5 requests, 1 flight); every further Tab there 0 |

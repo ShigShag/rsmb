@@ -4,8 +4,8 @@ Every test runs locally against the containers of [`test-environment.md`](test-e
 there is no CI service. `./test.sh` is the one command. The plans behind the rows below are
 [`plans/stage-1.md`](plans/stage-1.md), [`plans/stage-2.md`](plans/stage-2.md),
 [`plans/stage-3.md`](plans/stage-3.md) and [`plans/stage-4.md`](plans/stage-4.md), section 6 of
-each; the numbered rows (F1, S3, X5 …, F21, S21, X21 …, F41, S41, X41 … and F61, S61, X61 …)
-refer to them.
+each, and [`plans/stage-5.md`](plans/stage-5.md), section 7; the numbered rows (F1, S3, X5 …, F21,
+S21, X21 …, F41, S41, X41 …, F61, S61, X61 … and F71, S71, X71 …) refer to them.
 
 ## `./test.sh`
 
@@ -18,7 +18,7 @@ refer to them.
 | Step | Command | Lock |
 |---|---|---|
 | test environment up | `./testenv/up.sh` | its own |
-| stale test directories | `docker exec <c> sh -c 'rm -rf /srv/share/upload/rsmb-test-*'` on the three Samba containers | exclusive |
+| stale test directories | `docker exec <c> sh -c 'rm -rf /srv/share/upload/rsmb-test-*'` on the three Samba containers and the DC | exclusive |
 | test environment check | `./testenv/check.sh` | its own, exclusive |
 | cargo fmt --check | `cargo fmt --all --check` | none |
 | cargo clippy | `cargo clippy --workspace --all-targets -- -D warnings` | none |
@@ -61,26 +61,26 @@ project runs one gate at a time (`AGENTS.md`, one agent per task).
 
 ### Step times
 
-The final gate after the whole-codebase review (2026-11-18), environment up, binaries built:
-**full 456 s counted of 600** (total 457 s). The steps `./test.sh fast` runs took 57 s together in
-that run (it was not run separately afterwards; budget 150).
+The final gate of Stage 5 (2026-11-18), environment up (seven containers), binaries built:
+**full 477 s counted of 600** (total 480 s); `./test.sh fast` alone **62 s of 150** (total 63 s).
 
 | Step | Full | Fast |
 |---|---|---|
-| test environment up | 1 s (not counted) | 0 s |
+| test environment up | 1 s (not counted) | 1 s (not counted) |
 | stale test directories | 0 s | 0 s |
-| test environment check | 27 s | 27 s |
+| test environment check | 31 s | 31 s |
 | cargo fmt --check, cargo clippy | 0 s | 1 s |
-| build | 3 s (not counted) | 0 s |
-| unit tests | 3 s | 3 s |
-| tests/fast | 12 s (72 tests) | about 12 s |
-| tests/fast through the proxy | 15 s (72 tests, 165 proxy log lines) | about 15 s |
-| tests/slow | 31 s (44 tests) | — |
-| tests/serial | 365 s (25 tests) | — |
+| build | 2 s (not counted) | 0 s |
+| unit tests | 2 s (95 in rsmb, 12 in smbtap) | 2 s |
+| tests/fast | 13 s (78 tests) | 13 s |
+| tests/fast through the proxy | 15 s (78 tests, 165 proxy log lines) | 15 s |
+| tests/slow | 28 s (46 tests) | — |
+| tests/serial | 385 s (27 tests) | — |
 | smbtap against tshark | 3 s | — |
 
 Earlier figures: full 304 s of 420 after Stage 2, 386 s of 540 after Stage 3, 445 s after Stage 4
-(the plan expected about 458 s and 64 s).
+(the plan expected about 458 s and 64 s), 456 s after the final review of Stage 4 (fast 57 s);
+the Stage 5 plan expected about 482 s and 66 s.
 
 The integration tests run in the release profile (the wall-time and memory rows measure the
 binary that ships); the unit tests in the dev profile.
@@ -89,10 +89,10 @@ binary that ships); the unit tests in the dev profile.
 
 | Binary | What | Runs |
 |---|---|---|
-| unit tests (`src/*.rs`) | pure logic: tokeniser, quoting, paths, error mapping, listing plan, parser, cache, time format, the table and the manual, the receive half on a local socket, the walk on fake trees, the pattern matcher, sizes, the tree drawing, the end report | always |
-| `tests/fast.rs` | fast endpoint (10.213.45.10), safe beside other tests; run a second time through the proxy (`RSMB_TEST_VIA=socks5`) | `fast` and full, twice each |
-| `tests/slow.rs` | slow endpoint (100 ms each way), edge, wan-bad, the proxy's failures, its login port, its cuts and signals; each test has its own tap, so they run in parallel | full |
-| `tests/serial.rs` | anything that pauses a server, uses the blackhole, resets or reads the server-side connection count, or asserts a wall time or a number of new connections that depends on the 2 s of a cleanup | full, one at a time |
+| unit tests (`src/*.rs`) | pure logic: tokeniser, quoting, paths, error mapping, listing plan, parser, cache, time format, the table and the manual, the receive half on a local socket, the walk on fake trees, the pattern matcher, sizes, the tree drawing, the end report, the ticket cache's rules, `krb5.conf`, the KDC relay against a fake KDC and fake proxies on local sockets | always |
+| `tests/fast.rs` | fast endpoint (10.213.45.10) and, for Kerberos, the DC (10.213.45.12), safe beside other tests; run a second time through the proxy (`RSMB_TEST_VIA=socks5`) | `fast` and full, twice each |
+| `tests/slow.rs` | slow endpoint (100 ms each way), edge, wan-bad, the proxy's failures, its login port, its cuts and signals; what proves the KDC's side of a Kerberos login (its log, its failures); each test has its own tap, so they run in parallel | full |
+| `tests/serial.rs` | anything that pauses a server (the DC included), uses the blackhole, resets or reads the server-side connection count, counts the proxy's log exactly, or asserts a wall time or a number of new connections that depends on the 2 s of a cleanup | full, one at a time |
 
 `tests/slow.rs` runs its tests side by side on one `wan` link, several of them streaming 50 MiB;
 that is why a test that asserts a time belongs in `tests/serial.rs`. The only times `tests/slow.rs`
@@ -192,6 +192,33 @@ holds a `Guard` whose `Drop` undoes it, also when the test fails.
   `connect_ms(addr)`: median of 5 TCP connects after a warm-up. `q(name)`: the quoting, written
   again on purpose.
 
+- **Stage 5: Kerberos.** `Ep::Dc` (the DC by address, direct) and `Ep::DcProxied` (the DC as
+  `dc.rsmb.test` through the proxy's port 1080); `dc()` is the Kerberos endpoint of
+  `tests/fast.rs`, `Ep::Dc` or `Ep::DcProxied` with `RSMB_TEST_VIA=socks5`, and a test there names
+  `dc()`, never an address. For both, `container()` is `rsmb-samba-dc`, `args(tap)` is the route
+  and `-k` (no user, no password), `host(tapped)` is `127.0.0.1` tapped, `10.213.45.12` not,
+  `dc.rsmb.test` proxied, and `spn(tapped)` is the service name a session asks for:
+  `cifs/127.0.0.1` (direct, tapped), `cifs/10.213.45.12` (direct), `cifs/dc.rsmb.test` (proxied).
+  `krb_cache(dir, name, flag, user, spns)` makes a cache in the DC (`docker exec rsmb-samba-dc
+  mkcache -f|-F <user> <spns…>`, 0.1 s) and writes it to `dir/name` with mode 0600;
+  `expired_copy(cache)` writes a copy in which every ticket ended an hour ago (each run of four
+  big-endian 32-bit times near now gets `now - 3600` as its end); `krb5_conf(dir, kdc)` writes a
+  `krb5.conf` that names `kdc` for `RSMB.TEST`; `kdc_requests(user, addr)` counts the DC's log
+  lines `TGS-REQ <user>@RSMB.TEST from ipv4:<addr>:`; `Client::kerberos(ep, cache, extra, env)` is
+  a tapped `-k` session with `KRB5CCNAME=<cache>`; `Client::build` and `Pty::command` take an
+  `env` slice. **Every rsmb process the harness starts gets `KRB5_CONFIG=/dev/null` and
+  `KRB5CCNAME=/nonexistent/rsmb-test/krb5cc` (`NO_CACHE`)** unless the test sets them (`run_env`,
+  `run_in`, `run_sh`, `Client::build`, `Pty::command`): no test reads the host's `/etc/krb5.conf`,
+  the developer's `/tmp/krb5cc_<uid>` or a `KCM:` the shell exports. **A direct TGT-only run names
+  the KDC with `krb5_conf(dir, "10.213.45.12")`**: without it rsmb would ask `rsmb.test:88`,
+  which the host cannot resolve. A proxied run may use `/dev/null` (the proxy resolves
+  `rsmb.test`). **A tapped Kerberos session through the proxy holds the service ticket** for
+  `spn(true)`: with a TGT only, the KDC's connection would pass the tap (in SOCKS5 mode) as a
+  second connection of frames it cannot read; direct, the KDC's connection goes beside the tap,
+  so a tapped direct session may be TGT-only. `Scratch::new` on the DC makes the directory with
+  mode 1777 (a file written over SMB belongs to the id Samba maps the realm's user to, not to a
+  Unix user); `Scratch::sh` is not used there.
+
 Nothing waits without a limit; a timeout kills the child and panics with what was read.
 
 ## Counts
@@ -207,6 +234,8 @@ What the tests assert, per command, on Samba (fast and slow endpoint alike):
 | Command | Requests / flights | Test |
 |---|---|---|
 | start-up | 3 / 3 (NEGOTIATE, 2 × SESSION_SETUP), 1 connection | `startup_is_three_requests`, `startup_and_use_slow`, `interactive_basics` |
+| start-up with `-k` (Kerberos), service ticket in the cache or (direct) a TGT only | 2 / 2 (NEGOTIATE, 1 × SESSION_SETUP), 1 connection | `kerberos_login` |
+| after a cut with `-k`: `ls /` | 1 new connection, 8 requests (NEGOTIATE, SESSION_SETUP, TREE_CONNECT, the 5 of a listing); a cache that cannot be used: 0 connections | `kerberos_reconnect_reads_the_cache_again` |
 | `use share` first / again | 1 / 1 (TREE_CONNECT) / 0 | `use_once_per_share`, `startup_and_use_slow` |
 | `cd` to a sibling or below | 2 / 1, CREATE (chain 0 of 2) + CLOSE (1 of 2) | `cd_is_one_compound`, `cd_slow`, `cd_answers`, `timing_cd` (20 / 10 for 10) |
 | `cd` to the root or above, `pwd`, `help`, `refresh` | 0 | `free_commands_send_nothing`, `reconnect_after_idle_cut` |
@@ -273,6 +302,7 @@ Unit tests:
 | `filetime_cases`, `ls_line_format` | commands | UTC time formatting, before 1970 and at `u64::MAX`; the `ls` line |
 | `table_is_complete`, `help_all_has_everything`, `arguments_and_flags` | commands | the table (rule 2 of AGENTS.md), the manual's parts, flags against positionals |
 | `args_are_sound` | main | clap's own checks, `-p` against `--no-pass`, `--help-all` without `-H`, every long flag in the manual |
+| `manual_fits_80_columns`, `args_are_sound` | commands, main | every line of the text manual within 80 columns (a single word longer than a line excepted), `--json` not wrapped, wrapping changes nothing but white space and a flag's help continues under its column; every line of `--help` within 80 columns, the short help of `-k` without the details |
 
 `tests/fast.rs`:
 
@@ -283,7 +313,7 @@ Unit tests:
 | `examples_run` | H3, 1.12 | every example in the table runs on the test server |
 | `help_in_a_session` | H4, 1.12 | help sends nothing; `help all` equals `--help-all --json` |
 | `closed_stdout_is_not_a_panic` | N6 | no panic on a closed pipe (closed before rsmb starts, so every write fails whatever its size) |
-| `closed_stdout_ends_a_keep_going_run` | N7 | with `-k`, a closed stdout ends the run (exit 1, one message, one listing sent) |
+| `closed_stdout_ends_a_keep_going_run` | N7 | with `--keep-going`, a closed stdout ends the run (exit 1, one message, one listing sent) |
 | `startup_usage_errors` | final review 3, 13 | an argument that is not UTF-8 with `--json` is a `usage` error, exit 2 (it was a panic, 101); a missing `-H` with `--json` names `--host` |
 | `rmdir_guard_folds_case` | final review 4 | `rmdir` refuses the working directory and the ones above it however the case is spelled; the directory is still there |
 | `hostile_names_are_escaped_in_text` | final review 2 | a name with U+009B, one with U+202E and a directory with U+009B: `ls`, `find`, `tree`, `get` and an error line print them as `\u{..}` and no control or bidi character reaches stdout or stderr; `--json` has the exact name; `get` creates the exact local name |
@@ -293,7 +323,7 @@ Unit tests:
 | `no_password_no_prompt` | N1, 1.11 | exit 2 without prompting when stdin is not a terminal |
 | `ways_to_give_commands` | N2, 1.11 | `-C`, `-S`, stdin give the same output; `-S` before `-C`; an open stdin pipe is not read with `-C` |
 | `startup_failures` | N5, 1.11 | connect refused, bad proxy URL, missing script |
-| `stop_at_first_failure` | N3, 1.11 | exit 1 at the first failure, `-k`, unknown command, `-N` alone |
+| `stop_at_first_failure` | N3, 1.11 | exit 1 at the first failure, `--keep-going`, unknown command, `-N` alone |
 | `every_json_line_has_a_type` | N4, 1.11 | every JSON line has a listed type; one `done` per command |
 | `use_once_per_share` | F2 | one TREE_CONNECT per share |
 | `free_commands_send_nothing` | F3 | the zero rows |
@@ -528,7 +558,7 @@ Unit tests:
 | every test above | 4.1 | everything of Stages 1 to 3 through the proxy, with the same assertions, counts and checksums |
 | `proxy_urls_at_startup` | F61, 4.6, 4.9 | each refused URL form: exit 2, kind `usage`, the parser's `expected socks5://` (not clap's refusal of a second `--proxy`), empty stderr with `--json`; `socks5://user1:secretpw@…` and `socks5://alice:hunter2` show no part of the credentials; `-H` of 256 bytes with `--proxy` is `usage` naming 255, of 255 bytes reaches the proxy (exit 3, `connect`); the message of a 255-byte `-H` that reached the proxy starts with `proxy `; five accepted forms work against the private server; `help all` has `PROXY` and its example |
 | `environment_is_not_read` | F62, P8 | `ALL_PROXY`, `all_proxy`, `SOCKS_PROXY`, `RSMB_PROXY` pointing at a closed port change nothing |
-| `json_never_starts_the_shell` | I61, P12 | `--json` on a pty: no ESC byte, no prompt, every `{` line parses; typed lines then Ctrl-D exit 0 without a banner; a failing typed line ends the run with 1 before the next, with `-k` both run and Ctrl-D exits 1; `get` onto a local file is `already_exists` without `Overwrite?` |
+| `json_never_starts_the_shell` | I61, P12 | `--json` on a pty: no ESC byte, no prompt, every `{` line parses; typed lines then Ctrl-D exit 0 without a banner; a failing typed line ends the run with 1 before the next, with `--keep-going` both run and Ctrl-D exits 1; `get` onto a local file is `already_exists` without `Overwrite?` |
 | `interactive_basics` (extended) | I1, P11 | the banner names `through proxy 127.0.0.1:<tap port>` in the proxied run and holds no `proxy` direct |
 | `startup_failures` (extended) | N5 | `--proxy http://x` with its own command line: exit 2, `usage`, `expected socks5://` |
 | `docs_match_the_table` (extended) | H2 | `docs/commands.md` has the section "Proxy" with every message of a proxy failure |
@@ -564,3 +594,62 @@ same, plan 2.10); the wall time of anything through the proxy (it measures micro
 `docs/performance.md` records the planning measurement); a target whose SYN is dropped behind the
 proxy, and a proxy paused at start-up (the same dial and message as `silent_proxy`'s second
 `ls`).
+
+## Stage 5: Kerberos
+
+Unit tests (all in `src/session.rs` but the last two):
+
+| Test | Protects |
+|---|---|
+| `ccache_paths` | `KRB5CCNAME`: unset and empty give `/tmp/krb5cc_1000` for uid 1000 and say "default"; `FILE:/tmp/x`, `/tmp/a:b`, `./c`, `plain` are paths and not default; `KCM:`, `KCM:1000`, `KEYRING:persistent:1000`, `DIR:/run/x`, `MEMORY:y`, `API:z` are `auth` errors naming the type and `cache file`; a name with byte `\xe9` (plain, and after `FILE:`) is the variable's, not the default (review finding 2) |
+| `ticket_choice` | `pick_ticket` on caches built in the test: a valid service ticket (user and realm as the cache spells them; `-H` in another case finds it); a TGT only; an expired service ticket beside a valid TGT (the KDC is asked, the entry is gone); everything expired: the server's name and the literal `expired at 2026-11-18T19:25:28Z` for the end time 1,795,029,928 (written by hand, not computed); another host and no TGT: `holds no ticket for cifs/<host>@<realm>`; the hint `KRB5CCNAME is not set, so the default file` only for the default file; configuration entries (end time 0) never count; `-u TESTER -d rsmb.test` pass and keep the cache's spelling; `-u other` and `-d OTHER.TEST` name both sides; a principal with two parts. Every error `auth`, starting `Kerberos: ` |
+| `krb5_conf_kdc` | `krb5_kdc`: two realms, the first `kdc` of several, `kdc=h`, comments and tabs, `h:750`, `[::1]:88`, `[2001:db8::1]`, a bare `2001:db8::1` (the whole value, port 88), `tcp/h`, `udp/h:88`; a `kdc` under `[libdefaults]`, in `[domain_realm]`, in another realm's block or in a nested block (`auth_to_local_names = {`) is not taken, nor the next realm's after a nested block; the realm compared exactly; an HTTP KDC skipped |
+| `kdc_files` | `krb5_files(None)` and `(Some(""))` are `/etc/krb5.conf`, `"/a:/b"` is both in order; `kdc_for` on files the test wrote: the first that names a kdc wins and is returned with it, a missing path and a directory count as absent, none: `("rsmb.test", 88, None)`; a `KRB5_CONFIG` with a non-UTF-8 part is that part, never `/etc/krb5.conf`. Nothing reads the environment or `/etc` |
+| `non_regular_files_are_not_read` | a FIFO with no writer: `open_regular` says `not a regular file` and `kdc_for` treats it (and a directory) as absent, on a thread that must answer within 5 s (without `O_NONBLOCK` it blocks and the test fails on the bound; checked by removing the flag) |
+| `cache_owner_check` | the owner check: equal passes, different is `auth` naming both uids and `own user only` |
+| `kerberos_refusals` | `kerberos_refusal`: `STATUS_LOGON_FAILURE` keeps `login refused`; `STATUS_INVALID_PARAMETER` is `the server did not accept the ticket` with the status; the crate's own `Auth` and `InvalidData` (no status) are `could not be used` with the crate's text and no word about the server; `Disconnected` is a lost connection |
+| `kdc_errors` | `kdc_error` for 7, 13, 32, 36, 37 and 99 in the words of `commands.md` |
+| `kdc_relay_carries_the_exchange` | the relay against a fake KDC on a local TCP port and a UDP client (one socket, as the crate's) standing for the crate: each datagram arrives as 4 bytes of length and the same bytes, the answer comes back as one datagram, a second one too; a KRB-ERROR 7 ends it with `auth` and `has no service`, and the client gets nothing; a KDC that accepts and never answers, limit 200 ms, 20 at once: `connect`, `connected to the KDC, but it did not answer within 200 ms` every time (one timer at a time), within 2 s; a closed port: `connect`, `Connection refused`; a KDC that closes after the request: `connect`, `closed the connection without an answer`; through a fake proxy the KDC's name goes as a name (`05 01 00 03`, the length, `kdc.invalid`, port 88); a proxy that answers reply 5: `connect`, `proxy <p>: cannot reach <kdc>:<port>: connection refused`, for a name and for the fake KDC's own address, and the fake KDC accepted nothing (no way around the proxy); a silent proxy, 20 at once: `open_tcp`'s handshake message every time; the tails (`the KDC is the one <file> names`; `so the realm's name was tried`, `KRB5_CONFIG`, `kvno cifs/`, never `/etc/krb5.conf`). Every message starts `Kerberos: asking the KDC` |
+| `kdc_relay_serves_the_first_sender_only` | a second local socket's datagram is not forwarded (the fake KDC logs 2 requests, both the first sender's), gets no answer, and the first sender's exchanges go on (fails with the sender check removed) |
+| `classify_statuses`, `banner_names_the_proxy` (extended) | `SessionExpired` is `connection_lost` and says `ended the session`; the banner says `'RSMB.TEST\tester' (Kerberos) on` with `-k` and no `Kerberos` without |
+| `args_are_sound`, `table_is_complete`, `help_all_has_everything` (extended) | main, commands: `-k` sets `kerberos`, `-k -p x` and `-k --no-pass` are errors, `-k -u u -d D` parses, `--keep-going` has no short form, the help of `-k` names `KRB5CCNAME`; 9 topics, the topic `KERBEROS` with its words (and that the end of a ticket is a reading command run again, a changing one `connection_lost`, not the old "the next command fails"), the example line, no `unless -k` and no `-k (--keep-going)` left, the synopsis with `[-k] [-u <user>]` and `[--keep-going]` |
+
+`tests/fast.rs` (both runs: `dc()` is the DC by address, then by name through port 1080):
+
+| Test | Row | Protects |
+|---|---|---|
+| `kerberos_login` | F71 | a tapped session with the service ticket for `dc().spn(true)`: start-up 2 requests in 2 flights on 1 connection (NEGOTIATE 1, SESSION_SETUP 1); `use share` 1 / 1; `ls /` is `hello.txt`, `sub`, `upload`; `get /sub/1m.bin` and a `put` of 300,000 bytes (a signed write) with sha256 on both sides; `cat /hello.txt` on `encrypted`; exit 0, stderr empty. Direct also a TGT-only session with `krb5_conf`: again 2 / 2 on 1 connection in the tap, `ls /` works |
+| `kerberos_tgt_only` | F72 | one-shot, not tapped, a TGT-only cache (`-f`): direct with `krb5_conf`, proxied with `KRB5_CONFIG=/dev/null` (the KDC is `rsmb.test`, which only the proxy resolves): exit 0, 3 entries. A cache made with `-F`: exit 3, `auth`, `command` null, no `done`, `KDC_ERR_BADOPTION`, `kinit -f`, `kvno cifs/` |
+| `kerberos_cache_errors` | F73 | through a tap, text and `--json`: a missing file (the path, `No such file`, no default-file hint), `KCM:`, `DIR:/x`, a text file, an expired copy, `-u nobody`, `-d OTHER.TEST`, `/etc/hostname` (a file of another owner: `belongs to uid <owner>`, `own user only`; skipped with a printed line where it is the test's own): each exit 3, `auth`, starting `Kerberos: `; **the tap saw 0 connections**. Then `-u TESTER -d rsmb.test` logs in |
+| `kerberos_cache_odd_files` | F73b | one-shot, not tapped: a service-ticket cache copied to a path with byte `\xe9` and named by `KRB5CCNAME` (bytes, not UTF-8) logs in and lists 3 entries (it failed with the default file `/tmp/krb5cc_<uid>` and the "not set" hint before); a FIFO and a directory as the cache: exit 3, `auth`, `ticket cache <path>`, `not a regular file`, within 5 s (before, the FIFO hung until the harness's 60 s limit) |
+| `kerberos_usage` | F74 | `-k -p x`, `-k --no-pass`: exit 2, `usage`; `rsmb -H 127.0.0.1 -P 1 -k --json -N -C pwd` with the harness's `KRB5CCNAME`: exit 3, `auth`, `ticket cache /nonexistent/rsmb-test/krb5cc` and `No such file` (no password asked, the cache read before port 1 was dialled); `help all` has `KERBEROS`, `-k, --kerberos` and the option `--keep-going` without a short form |
+| `kerberos_reconnect_reads_the_cache_again` | F75 | the cache renamed away and the connection cut: `ls /` fails, `auth`, `reconnect failed: Kerberos: ticket cache <path>`, 0 connections; `pwd` works; the file back: `ls /` on exactly 1 new connection with 8 requests; the file replaced by a cache of `kother`, a cut: `ls /` fails, `auth`, naming `kother@RSMB.TEST` and `tester` (the session keeps its principal) |
+| `kerberos_banner` | F76 | on a pty with `-k` and a cache: the banner `logged in as 'RSMB.TEST\tester' (Kerberos) on`, no `Password`, `through proxy` exactly in the proxied run |
+| `docs_match_the_table` (extended) | H2 | the section `## Kerberos` of `commands.md` holds every message stem of the code (the unit tests assert the same words in the code) and both kinds, `auth` and `connect` |
+
+`tests/slow.rs`:
+
+| Test | Row | Protects |
+|---|---|---|
+| `kerberos_kdc_is_asked_through_the_proxy` | S71 | TGT-only caches of `kdirect` and `kproxy`, which no other test uses; `kdc_requests` waited for, then exact. The control: direct to 10.213.45.12 with `krb5_conf`, `kdirect` from 10.213.45.1 rose by exactly 1. Through port 1080 by name, with a `krb5_conf` whose KDC the host reaches directly: `kproxy` from 10.213.45.20 +1, from 10.213.45.1 unchanged from the count taken before (the log is the container's whole log, so a count of 0 would fail for one old direct request; now and at the end), the proxy logged `connected to 10.213.45.12:88`; again with `KRB5_CONFIG=/dev/null`: +1 from the proxy, the proxy logged `connected to rsmb.test:88`; again through port 1081 with a login. With the service-ticket cache of `kproxy`: no new line at all |
+| `kerberos_failures` | S72 | text and `--json`, exit 3, one `error`, `command` null, no `done`: a KDC with port 88 closed (`connect`, within 2 s, `Kerberos: asking the KDC 10.213.45.10:88`, `refused`, the file's name); no kdc in the files direct (`connect`, `KDC rsmb.test:88`, `so the realm's name was tried`, `KRB5_CONFIG`, `kvno cifs/10.213.45.12`); an SPN the realm lacks (`-H 10.213.45.11`: `auth`, `has no service`); a valid ticket at `samba`, which does no Kerberos (`auth`, `did not accept the ticket`); through port 1080 a KDC name the proxy cannot resolve and an absent address (`connect`, `proxy 10.213.45.20:1080: cannot reach …`, within 12 s); a closed proxy port with a server and KDC the host reaches directly (`connect`, the message starts `proxy 10.213.45.20:1082`) |
+| `no_way_around_the_proxy` (extended) | S64 | a TGT-only Kerberos login through the proxy by name with `KRB5_CONFIG=/dev/null` (KDC `rsmb.test`) works and loads no `libnss_` module, beside the control that loads some |
+
+`tests/serial.rs`:
+
+| Test | Row | Protects |
+|---|---|---|
+| `silent_kdc` | X71 | `ctl.sh pause samba-dc` under a guard, a TGT-only login at `samba` with `krb5_conf`: exit 3 after 9 to 13 s (10.0 s measured), `connect`, `KDC 10.213.45.12:88`, `connected to the KDC, but it did not answer within 10 s`; after the unpause a login at the DC works |
+| `kerberos_connections_through_the_proxy` | X72 | through port 1080 by name with `KRB5_CONFIG=/dev/null`: a TGT-only login is exactly 1 more `connected to rsmb.test:88` and 1 more `connected to dc.rsmb.test:445` in the proxy's log; with the service ticket 1 more `:445` and 0 more `:88` |
+
+Not in the gate (Stage 5), and why: a session that outlives its ticket (the shortest ticket this
+KDC issues for a service is 121 s, and the server accepts it five minutes past its end; measured
+by hand while planning; the message's mapping is a unit test); a Windows KDC or server, an MIT
+KDC; a cache written by impacket (it could not make one against this KDC); latency in front of
+the DC (the round trips are counted); a TGT that is forwardable and not renewable (Heimdal's
+default; measured by hand; the gate has the not-forwardable case); the cache file that aborts the
+crate's parser (decision K13); the default file `/tmp/krb5cc_<uid>` through the binary (the
+harness keeps every test away from it; `ccache_paths` and `ticket_choice` hold the rule and the
+hint); a KDC found by the realm's name without a proxy (the host cannot resolve `rsmb.test`; S72
+asserts the failure and its message); a realm with more than one KDC, a `krb5.conf` with
+`include`; a clock difference between client and KDC (the containers share the host's clock).

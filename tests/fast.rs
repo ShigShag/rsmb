@@ -114,14 +114,14 @@ fn closed_stdout_is_not_a_panic() {
     assert!(!err.contains("panicked"), "{err}");
 }
 
-/// A stdout that goes away ends the run, `-k` or not: no more commands are sent to the server.
+/// A stdout that goes away ends the run, `--keep-going` or not: no more commands are sent to the server.
 #[test]
 fn closed_stdout_ends_a_keep_going_run() {
     use std::io::{BufRead, BufReader};
     let tap = fast().tap();
     let route = fast().args(Some(&tap));
     let mut args: Vec<&str> = route.iter().map(String::as_str).collect();
-    args.extend(["-k", "-C", "use share"]);
+    args.extend(["--keep-going", "-C", "use share"]);
     args.extend([
         "-C", "ls /many", "-C", "ls /many", "-C", "ls /many", "-C", "pwd",
     ]);
@@ -221,7 +221,7 @@ fn no_password_no_prompt() {
         "{BIN} {} -u tester -d TESTDOM -C pwd < /dev/null",
         route.join(" ")
     );
-    let mut pty = Pty::command("sh", &["-c", &line], &dir.join("history"));
+    let mut pty = Pty::command("sh", &["-c", &line], &dir.join("history"), &[]);
     let rest = pty.rest(Duration::from_millis(1500));
     // The usage error itself says "no password", so the check is for the prompt's own text.
     assert!(!rest.contains("Password for"), "prompted: {rest:?}");
@@ -432,6 +432,43 @@ fn docs_match_the_table() {
     ] {
         assert!(proxy.contains(m), "the section Proxy lacks {m:?}");
     }
+    // The section "Kerberos" holds every message of a Kerberos failure (docs/plans/stage-5.md,
+    // H2); the unit tests assert the same words in the code.
+    let kerberos = doc
+        .split("\n## Kerberos\n")
+        .nth(1)
+        .and_then(|r| r.split("\n## ").next())
+        .expect("docs/commands.md has a section '## Kerberos'");
+    for m in [
+        "names a ticket cache of type",
+        "is not a ticket cache rsmb can read",
+        "belongs to uid",
+        "own user only",
+        "more than one name part",
+        "not to '",
+        "expired at",
+        "holds no ticket for cifs/",
+        "KRB5CCNAME is not set, so the default file",
+        "asking the KDC",
+        "connected to the KDC, but it did not answer within 10 s",
+        "closed the connection without an answer",
+        "has no service cifs/",
+        "KDC_ERR_BADOPTION",
+        "kinit -f",
+        "kvno cifs/",
+        "the ticket-granting ticket has expired",
+        "clocks",
+        "KRB_AP_ERR_BADMATCH",
+        "KDC error",
+        "so the realm's name was tried",
+        "did not accept the ticket",
+        "could not be used",
+        "ended the session",
+        "`auth`",
+        "`connect`",
+    ] {
+        assert!(kerberos.contains(m), "the section Kerberos lacks {m:?}");
+    }
     // The exit codes: the manual, commands.md and scripting.md say the same.
     let scripting =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/scripting.md")).unwrap();
@@ -520,7 +557,10 @@ fn every_json_line_has_a_type() {
         "rmdir nope",
         "exit",
     ];
-    let o = run_fast(&["--json", "-k"], Some(&format!("{}\n", lines.join("\n"))));
+    let o = run_fast(
+        &["--json", "--keep-going"],
+        Some(&format!("{}\n", lines.join("\n"))),
+    );
     assert!(o.stderr.is_empty(), "stderr: {}", o.stderr);
     let objs = o.json();
     let mut dones = Vec::new();
@@ -656,13 +696,21 @@ fn stop_at_first_failure() {
     assert_eq!(o.code, 1);
     assert!(!o.stdout.contains("//"), "pwd ran: {}", o.stdout);
     let o = run_fast(
-        &["-k", "-C", "use share", "-C", "cd nope", "-C", "pwd"],
+        &[
+            "--keep-going",
+            "-C",
+            "use share",
+            "-C",
+            "cd nope",
+            "-C",
+            "pwd",
+        ],
         None,
     );
     assert_eq!(o.code, 1);
     assert!(
         o.stdout.contains("/share/"),
-        "pwd missing with -k: {}",
+        "pwd missing with --keep-going: {}",
         o.stdout
     );
     let o = run_fast(&["--json", "-C", "nosuch"], None);
@@ -1130,7 +1178,7 @@ fn sigterm_in_the_shell() {
             fast().args(None).join(" ")
         );
         script.push_str("; echo END");
-        let mut p = Pty::command("sh", &["-c", &script], &hist);
+        let mut p = Pty::command("sh", &["-c", &script], &hist, &[]);
         let prompt = format!("//{}> ", fast().host(false));
         p.expect(&prompt, WAIT);
         p.line("pwd", &prompt);
@@ -2292,7 +2340,7 @@ fn hostile_names_are_escaped_in_text() {
         format!("get {}", at(rlo)),
         format!("cd {}", at(csi)),
     ];
-    let mut args = fast_args(&["-k", "-C", "use share"]);
+    let mut args = fast_args(&["--keep-going", "-C", "use share"]);
     for c in &cmds {
         args.extend(["-C".to_string(), c.clone()]);
     }
@@ -2417,7 +2465,7 @@ fn cat_output() {
     let o = run_fast(
         &[
             "--json",
-            "-k",
+            "--keep-going",
             "-C",
             "use share",
             "-C",
@@ -3836,7 +3884,9 @@ fn proxy_urls_at_startup() {
         o.stdout.contains("\nPROXY\n"),
         "help all has the topic PROXY"
     );
-    assert!(o.stdout.contains(
+    // the manual is wrapped to 80 columns: compare with runs of white space as one space
+    let squashed = o.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(squashed.contains(
         "rsmb --proxy socks5://127.0.0.1:1080 -H fileserver.example -u alice -d CORP -N -C 'use \
          docs' -C 'ls'"
     ));
@@ -3908,7 +3958,7 @@ fn json_never_starts_the_shell() {
         .map(|o| o["type"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(types, ["pwd", "done"], "{s}");
-    // The first failing typed line ends the run, as from a pipe; with -k both run.
+    // The first failing typed line ends the run, as from a pipe; with --keep-going both run.
     let mut p = start(&[]);
     p.send(b"use share\r");
     p.expect("\"type\":\"done\"", WAIT);
@@ -3918,7 +3968,7 @@ fn json_never_starts_the_shell() {
     let v = json_lines(&t);
     assert!(v.iter().all(|o| o["type"] != "pwd"), "pwd ran: {v:?}");
     assert!(v.iter().any(|o| o["kind"] == "not_found"), "{v:?}");
-    let mut p = start(&["-k"]);
+    let mut p = start(&["--keep-going"]);
     p.send(b"use share\r");
     p.expect("\"type\":\"done\"", WAIT);
     p.send(b"cd /nope\rpwd\r");
@@ -3928,7 +3978,7 @@ fn json_never_starts_the_shell() {
     assert_eq!(
         code,
         1,
-        "-k: the first failure's code: {}",
+        "--keep-going: the first failure's code: {}",
         t.escape_ascii()
     );
     assert!(json_lines(&t).iter().any(|o| o["type"] == "pwd"));
@@ -3944,4 +3994,411 @@ fn json_never_starts_the_shell() {
         "{s}"
     );
     assert_eq!(std::fs::read(dir.join("1.bin")).unwrap(), b"keep");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 5: Kerberos (docs/plans/stage-5.md 7.4). `dc()` is the DC by address direct, and the DC
+// by name through the proxy in the proxied run.
+
+/// A krb5.conf that names the DC's KDC by address, which the host reaches (a direct TGT-only run
+/// needs it: without it rsmb asks `rsmb.test`, which only the proxy resolves).
+fn dc_conf(dir: &std::path::Path) -> String {
+    krb5_conf(dir, DC).to_str().unwrap().to_string()
+}
+
+/// One-shot `-k` run to `dc()` with KRB5CCNAME=`cache`, KRB5_CONFIG=`conf`, then `extra`.
+fn run_dc(route: &[String], cache: &str, conf: &str, extra: &[&str]) -> Output {
+    let mut a: Vec<&str> = route.iter().map(String::as_str).collect();
+    a.push("-k");
+    a.extend(extra);
+    run_env(&a, None, &[("KRB5CCNAME", cache), ("KRB5_CONFIG", conf)])
+}
+
+/// The one `error` object of a failed start-up: exit 3, `command` null, no `done`.
+fn startup_error(o: &Output, what: &str) -> Value {
+    assert_eq!(o.code, 3, "{what}: {}", o.stdout);
+    let v = o.json();
+    assert_eq!(v.len(), 1, "{what}: {}", o.stdout);
+    assert_eq!(v[0]["type"], "error", "{what}");
+    assert_eq!(v[0]["command"], Value::Null, "{what}");
+    v[0].clone()
+}
+
+/// F71: a Kerberos session with the service ticket in the cache: 2 requests at start-up, a
+/// listing, a read and a signed write with checksums, the encrypted share. Direct, also a
+/// TGT-only start-up in the tap (the KDC's connection goes beside it).
+#[test]
+fn kerberos_login() {
+    let ep = dc();
+    let dir = tmp("kerberos_login");
+    let cache = krb_cache(&dir, "svc.cc", "-f", "tester", &[ep.spn(true)]);
+    let s = Scratch::new(ep);
+    let mut c = Client::kerberos(ep, &cache, &[], &[]);
+    let st = c.startup.stats();
+    c.startup
+        .expect("Kerberos start-up: NEGOTIATE 1, SESSION_SETUP 1", 2, 2);
+    assert_eq!(count(st, "NEGOTIATE"), 1);
+    assert_eq!(count(st, "SESSION_SETUP"), 1);
+    assert_eq!(st.connections, 1, "{}", context(st));
+    let r = c.cmd("use share");
+    r.expect_ok("use share");
+    r.expect("use share", 1, 1);
+    let r = c.cmd("ls /");
+    r.expect_ok("ls /");
+    let names: BTreeSet<Vec<u8>> = ["hello.txt", "sub", "upload"]
+        .iter()
+        .map(|n| n.as_bytes().to_vec())
+        .collect();
+    assert_eq!(r.names(), names);
+    c.cmd(&format!("lcd {}", q(&dir.to_string_lossy())))
+        .expect_ok("lcd");
+    c.cmd("get /sub/1m.bin").expect_ok("get");
+    assert_eq!(
+        local_sha(&dir.join("1m.bin")),
+        server_sha(SAMBA_DC, "/srv/share/sub/1m.bin")
+    );
+    make_file(&dir.join("up.bin"), 300_000, 7);
+    c.cmd(&format!("put up.bin {}/up.bin", s.remote()))
+        .expect_ok("put");
+    assert_eq!(
+        server_sha(SAMBA_DC, &format!("{}/up.bin", s.server())),
+        local_sha(&dir.join("up.bin"))
+    );
+    c.cmd("use encrypted").expect_ok("use encrypted");
+    let r = c.cmd("cat /hello.txt");
+    r.expect_ok("cat on encrypted");
+    assert_eq!(r.of("content")[0]["text"], "kerberos works\n");
+    let (code, err) = c.finish();
+    assert_eq!((code, err.as_str()), (0, ""));
+    if !ep.proxied() {
+        // TGT-only, tapped as 127.0.0.1: the KDC is asked beside the tap (K15, finding 15).
+        let tgt = krb_cache(&dir, "tgt.cc", "-f", "tester", &[]);
+        let conf = dc_conf(&dir);
+        let mut c = Client::kerberos(ep, &tgt, &[], &[("KRB5_CONFIG", &conf)]);
+        c.startup.expect(
+            "TGT-only start-up in the tap: NEGOTIATE 1, SESSION_SETUP 1",
+            2,
+            2,
+        );
+        assert_eq!(c.startup.stats().connections, 1);
+        c.cmd("use share").expect_ok("use share");
+        c.cmd("ls /").expect_ok("ls / with a TGT-only login");
+    }
+}
+
+/// F72: TGT-only: the KDC is asked (direct by the address a krb5.conf names; through the proxy by
+/// the realm's name, which only the proxy resolves). A TGT that is not forwardable is refused by
+/// this KDC, with a message that says what to do.
+#[test]
+fn kerberos_tgt_only() {
+    let ep = dc();
+    let dir = tmp("kerberos_tgt_only");
+    let route = ep.route(None);
+    let conf = if ep.proxied() {
+        "/dev/null".to_string()
+    } else {
+        dc_conf(&dir)
+    };
+    let f = krb_cache(&dir, "f.cc", "-f", "tester", &[]);
+    let o = run_dc(
+        &route,
+        f.to_str().unwrap(),
+        &conf,
+        &["--json", "-N", "-C", "use share", "-C", "ls /"],
+    );
+    assert_eq!(o.code, 0, "{}", o.stdout);
+    assert_eq!(o.json().iter().filter(|v| v["type"] == "entry").count(), 3);
+    let nf = krb_cache(&dir, "nf.cc", "-F", "tester", &[]);
+    let o = run_dc(
+        &route,
+        nf.to_str().unwrap(),
+        &conf,
+        &["--json", "-N", "-C", "ls"],
+    );
+    let e = startup_error(&o, "not forwardable");
+    assert_eq!(e["kind"], "auth");
+    let m = e["message"].as_str().unwrap();
+    for w in ["KDC_ERR_BADOPTION", "kinit -f", "kvno cifs/"] {
+        assert!(m.contains(w), "{w}: {m}");
+    }
+}
+
+/// F73: what is wrong with the cache is found before anything is dialled: kind auth, exit 3, a
+/// message that starts `Kerberos: `, and no connection in the tap.
+#[test]
+fn kerberos_cache_errors() {
+    use std::os::unix::fs::MetadataExt;
+    let ep = dc();
+    let dir = tmp("kerberos_cache_errors");
+    let tap = ep.tap();
+    let route = ep.route(Some(&tap));
+    let good = krb_cache(&dir, "good.cc", "-f", "tester", &[ep.spn(true)]);
+    let good = good.to_str().unwrap().to_string();
+    let absent = dir.join("absent").to_str().unwrap().to_string();
+    let text = dir.join("text.cc");
+    std::fs::write(&text, "not a cache\n").unwrap();
+    let text = text.to_str().unwrap().to_string();
+    let expired = expired_copy(std::path::Path::new(&good));
+    let expired = expired.to_str().unwrap().to_string();
+    let me = std::fs::metadata(&dir).unwrap().uid();
+    let mut cases: Vec<(String, Vec<&str>, Vec<String>)> = vec![
+        (
+            absent.clone(),
+            vec![],
+            vec![absent.clone(), "No such file".into()],
+        ),
+        ("KCM:".into(), vec![], vec!["'KCM'".into()]),
+        ("DIR:/x".into(), vec![], vec!["'DIR'".into()]),
+        (text.clone(), vec![], vec!["is not a ticket cache".into()]),
+        (expired, vec![], vec!["expired at".into()]),
+        (
+            good.clone(),
+            vec!["-u", "nobody"],
+            vec!["tester@RSMB.TEST".into(), "nobody".into()],
+        ),
+        (
+            good.clone(),
+            vec!["-d", "OTHER.TEST"],
+            vec!["RSMB.TEST".into(), "OTHER.TEST".into()],
+        ),
+    ];
+    // A file of another owner (finding 13).
+    match std::fs::metadata("/etc/hostname").map(|m| m.uid()) {
+        Ok(owner) if owner != me && me != 0 => cases.push((
+            "/etc/hostname".into(),
+            vec![],
+            vec![format!("belongs to uid {owner}"), "own user only".into()],
+        )),
+        _ => println!("skipped: /etc/hostname is missing or belongs to the user running the test"),
+    }
+    for (cache, extra, words) in &cases {
+        for json in [true, false] {
+            let mut x = extra.clone();
+            x.extend(["-N", "-C", "pwd"]);
+            if json {
+                x.push("--json");
+            }
+            let o = run_dc(&route, cache, "/dev/null", &x);
+            let what = format!("{cache} {extra:?} json {json}");
+            let m = if json {
+                let e = startup_error(&o, &what);
+                assert_eq!(e["kind"], "auth", "{what}");
+                e["message"].as_str().unwrap().to_string()
+            } else {
+                assert_eq!(o.code, 3, "{what}: {}", o.stderr);
+                o.stderr
+                    .strip_prefix("rsmb: ")
+                    .unwrap_or(&o.stderr)
+                    .to_string()
+            };
+            assert!(m.starts_with("Kerberos: "), "{what}: {m}");
+            for w in words {
+                assert!(m.contains(w.as_str()), "{what}: {w:?} not in {m}");
+            }
+            assert!(!m.contains("KRB5CCNAME is not set"), "{what}: {m}");
+        }
+    }
+    assert_eq!(take(&tap).connections, 0, "nothing was dialled");
+    let o = run_dc(
+        &route,
+        &good,
+        "/dev/null",
+        &["-u", "TESTER", "-d", "rsmb.test", "-N", "-C", "pwd"],
+    );
+    assert_eq!(o.code, 0, "-u and -d in another case: {}", o.stderr);
+}
+
+/// F73b: a cache whose name is not UTF-8 is the one KRB5CCNAME names (it was taken as unset, and
+/// the default file used); a cache that is not a regular file (a FIFO, a directory) is refused at
+/// once, where `open` on a FIFO waited for good and ignored SIGINT.
+#[test]
+fn kerberos_cache_odd_files() {
+    use std::os::unix::ffi::OsStrExt;
+    let ep = dc();
+    let dir = tmp("kerberos_cache_odd_files");
+    let route = ep.route(None);
+    let good = krb_cache(&dir, "good.cc", "-f", "tester", &[ep.spn(false)]);
+    let odd = dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9.cc"));
+    std::fs::copy(&good, &odd).unwrap();
+    let o = Command::new(BIN)
+        .args(&route)
+        .args(["-k", "--json", "-N", "-C", "use share", "-C", "ls /"])
+        .env("KRB5CCNAME", &odd)
+        .env("KRB5_CONFIG", "/dev/null")
+        .env("RSMB_HISTORY", "")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(out.matches("\"type\":\"entry\"").count(), 3, "{out}");
+
+    let fifo = dir.join("fifo");
+    let made = Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo");
+    for cache in [fifo, dir.clone()] {
+        let shown = cache.to_str().unwrap();
+        let o = run_dc(&route, shown, "/dev/null", &["--json", "-N", "-C", "pwd"]);
+        assert!(o.took < Duration::from_secs(5), "{shown}: {:?}", o.took);
+        let e = startup_error(&o, shown);
+        assert_eq!(e["kind"], "auth", "{shown}");
+        let m = e["message"].as_str().unwrap();
+        assert!(
+            m.starts_with("Kerberos: ticket cache ")
+                && m.contains(shown)
+                && m.contains("not a regular file"),
+            "{shown}: {m}"
+        );
+    }
+}
+
+/// F74: `-k` excludes -p and --no-pass, asks for no password, reads the cache it is told to before
+/// it dials; the manual has the topic and the flags.
+#[test]
+fn kerberos_usage() {
+    for pw in [&["-p", "x"][..], &["--no-pass"][..]] {
+        let mut a = vec!["-H", "h", "-k"];
+        a.extend(pw);
+        let o = run(&a, None);
+        assert_eq!(o.code, 2, "{pw:?}: {}", o.stderr);
+        a.push("--json");
+        let o = run(&a, None);
+        assert_eq!(o.code, 2, "{pw:?}");
+        assert_eq!(error_kind(&o), "usage", "{pw:?}");
+    }
+    // The harness's KRB5CCNAME: a path the test controls, read before port 1 is dialled.
+    let o = run(
+        &[
+            "-H",
+            "127.0.0.1",
+            "-P",
+            "1",
+            "-k",
+            "--json",
+            "-N",
+            "-C",
+            "pwd",
+        ],
+        None,
+    );
+    let e = startup_error(&o, "the harness's cache");
+    assert_eq!(e["kind"], "auth");
+    let m = e["message"].as_str().unwrap();
+    assert!(
+        m.contains(&format!("ticket cache {NO_CACHE}")) && m.contains("No such file"),
+        "{m}"
+    );
+    let manual = run(&["--help-all"], None).stdout;
+    assert!(manual.contains("\nKERBEROS\n"), "the topic");
+    assert!(manual.contains("-k, --kerberos"), "the flag");
+    let opts = manual_json();
+    let keep = opts
+        .iter()
+        .filter(|v| v["type"] == "option")
+        .find(|v| v["flag"].as_str().unwrap().contains("--keep-going"))
+        .unwrap();
+    assert_eq!(keep["flag"], "--keep-going", "no short form");
+}
+
+/// F75: a reconnect reads the cache again: gone, back, another principal.
+#[test]
+fn kerberos_reconnect_reads_the_cache_again() {
+    let ep = dc();
+    let dir = tmp("kerberos_reconnect_reads_the_cache_again");
+    let cache = krb_cache(&dir, "svc.cc", "-f", "tester", &[ep.spn(true)]);
+    let other = krb_cache(&dir, "other.cc", "-f", "kother", &[ep.spn(true)]);
+    let away = dir.join("away.cc");
+    let mut c = Client::kerberos(ep, &cache, &[], &[]);
+    c.cmd("use share").expect_ok("use share");
+    c.cmd("ls /").expect_ok("ls /");
+    let cut = |c: &mut Client| {
+        assert_eq!(c.tap().drop_connections(), 1);
+        let deadline = std::time::Instant::now() + WAIT;
+        while c.tap().live_connections() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cut connection stays live"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        take(c.tap());
+    };
+    std::fs::rename(&cache, &away).unwrap();
+    cut(&mut c);
+    let r = c.cmd("ls /");
+    assert_eq!(r.kind().as_deref(), Some("auth"), "{:?}", r.lines);
+    let m = r.of("error")[0]["message"].as_str().unwrap().to_string();
+    let path = cache.to_str().unwrap();
+    assert!(
+        m.contains("reconnect failed: Kerberos: ticket cache") && m.contains(path),
+        "{m}"
+    );
+    assert_eq!(
+        r.stats().connections,
+        0,
+        "a cache that cannot be used costs no connection"
+    );
+    c.cmd("pwd").expect_ok("pwd");
+    std::fs::rename(&away, &cache).unwrap();
+    let r = c.cmd("ls /");
+    r.expect_ok("ls / with the cache back");
+    let st = r.stats();
+    assert_eq!(
+        st.connections,
+        1,
+        "exactly 1 new connection\n{}",
+        context(st)
+    );
+    assert_eq!(
+        st.requests,
+        8,
+        "NEGOTIATE, SESSION_SETUP, TREE_CONNECT and the 5 of a listing\n{}",
+        context(st)
+    );
+    assert_eq!(count(st, "SESSION_SETUP"), 1, "{}", context(st));
+    std::fs::rename(&other, &cache).unwrap();
+    cut(&mut c);
+    let r = c.cmd("ls /");
+    assert_eq!(r.kind().as_deref(), Some("auth"), "{:?}", r.lines);
+    let m = r.of("error")[0]["message"].as_str().unwrap();
+    assert!(
+        m.contains("kother@RSMB.TEST") && m.contains("'tester'"),
+        "{m}"
+    );
+}
+
+/// F76: the banner says Kerberos (and the proxy through it); nothing asks for a password.
+#[test]
+fn kerberos_banner() {
+    let ep = dc();
+    let dir = tmp("kerberos_banner");
+    let cache = krb_cache(&dir, "svc.cc", "-f", "tester", &[ep.spn(true)]);
+    let tap = ep.tap();
+    let args = ep.args(Some(&tap));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut p = Pty::command(
+        BIN,
+        &args,
+        &dir.join("history"),
+        &[("KRB5CCNAME", cache.to_str().unwrap())],
+    );
+    p.expect(&format!("//{}> ", ep.host(true)), WAIT);
+    let t = p.transcript();
+    assert!(
+        // The transcript is escaped: ' and \ come as \' and \\.
+        t.contains("logged in as \\'RSMB.TEST\\\\tester\\' (Kerberos) on"),
+        "{t}"
+    );
+    assert!(!t.contains("Password"), "{t}");
+    assert_eq!(t.contains("through proxy"), ep.proxied(), "{t}");
+    p.send(b"exit\r");
+    assert_eq!(p.exit_code(WAIT), 0);
 }

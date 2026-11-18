@@ -36,7 +36,22 @@ pub enum Ep {
     Proxied,
     /// The private server through the proxy's port 1081 (`tester:testpass` at the proxy).
     ProxiedLogin,
+    /// The Kerberos server (`samba-dc`) by address, direct.
+    Dc,
+    /// The Kerberos server as `dc.rsmb.test` through the proxy's port 1080.
+    DcProxied,
 }
+
+/// The DC's name, which only the proxy resolves, and its address.
+pub const DC_NAME: &str = "dc.rsmb.test";
+pub const DC: &str = "10.213.45.12";
+/// The container of the DC.
+pub const SAMBA_DC: &str = "rsmb-samba-dc";
+/// The `KRB5CCNAME` every rsmb process of the harness gets unless the test sets it: a path that
+/// does not exist, so no test reads the developer's `/tmp/krb5cc_<uid>` or a `KCM:` the shell
+/// exports. `KRB5_CONFIG` is `/dev/null` the same way.
+pub const NO_CACHE: &str = "/nonexistent/rsmb-test/krb5cc";
+const KRB5_DEFAULTS: [(&str, &str); 2] = [("KRB5_CONFIG", "/dev/null"), ("KRB5CCNAME", NO_CACHE)];
 
 /// The private server's name, which only the proxy resolves.
 pub const PRIVATE: &str = "fileserver.rsmb.test";
@@ -50,8 +65,9 @@ impl Ep {
             Ep::Slow => "10.213.45.30:445",
             Ep::Edge => "10.213.45.11:445",
             Ep::Bad => "10.213.45.31:445",
-            Ep::Proxied => "10.213.45.20:1080",
+            Ep::Proxied | Ep::DcProxied => "10.213.45.20:1080",
             Ep::ProxiedLogin => "10.213.45.20:1081",
+            Ep::Dc => "10.213.45.12:445",
         }
     }
     /// The container whose disk the endpoint serves.
@@ -59,11 +75,25 @@ impl Ep {
         match self {
             Ep::Edge => "rsmb-samba-edge",
             Ep::Proxied | Ep::ProxiedLogin => "rsmb-samba-private",
+            Ep::Dc | Ep::DcProxied => SAMBA_DC,
             _ => "rsmb-samba",
         }
     }
     pub fn proxied(self) -> bool {
-        matches!(self, Ep::Proxied | Ep::ProxiedLogin)
+        matches!(self, Ep::Proxied | Ep::ProxiedLogin | Ep::DcProxied)
+    }
+    pub fn kerberos(self) -> bool {
+        matches!(self, Ep::Dc | Ep::DcProxied)
+    }
+    /// The SPN a session to this endpoint asks for: `cifs/127.0.0.1` (Dc, tapped),
+    /// `cifs/10.213.45.12` (Dc, not tapped), `cifs/dc.rsmb.test` (DcProxied).
+    pub fn spn(self, tapped: bool) -> &'static str {
+        match self {
+            Ep::DcProxied => "cifs/dc.rsmb.test",
+            Ep::Dc if tapped => "cifs/127.0.0.1",
+            Ep::Dc => "cifs/10.213.45.12",
+            _ => panic!("{self:?} is not a Kerberos endpoint"),
+        }
     }
     /// A new tap in front of the endpoint: `Tap::start`, or `Tap::start_socks5` for the proxied two.
     pub fn tap(self) -> Tap {
@@ -75,7 +105,7 @@ impl Ep {
     }
     /// The flags that reach the endpoint, without the login. Direct: `-H <host> -P <port>` of the
     /// server, or of `tap`. Proxied: `--proxy socks5://[tester:testpass@]<proxy or tap> -H
-    /// fileserver.rsmb.test -P 445`.
+    /// fileserver.rsmb.test -P 445` (`-H dc.rsmb.test` for the DC).
     pub fn route(self, tap: Option<&Tap>) -> Vec<String> {
         let addr = tap.map_or(self.addr().to_string(), |t| t.addr().to_string());
         if self.proxied() {
@@ -85,7 +115,12 @@ impl Ep {
                 ""
             };
             let url = format!("socks5://{login}{addr}");
-            ["--proxy", &url, "-H", PRIVATE, "-P", "445"]
+            let host = if self == Ep::DcProxied {
+                DC_NAME
+            } else {
+                PRIVATE
+            };
+            ["--proxy", &url, "-H", host, "-P", "445"]
                 .map(String::from)
                 .to_vec()
         } else {
@@ -94,18 +129,23 @@ impl Ep {
         }
     }
     /// The host as the prompt and `pwd` show it: the tap's 127.0.0.1 or the server's address for
-    /// a direct endpoint, `fileserver.rsmb.test` for a proxied one.
+    /// a direct endpoint, `fileserver.rsmb.test` (`dc.rsmb.test`) for a proxied one.
     pub fn host(self, tapped: bool) -> &'static str {
         match self {
+            Ep::DcProxied => DC_NAME,
             _ if self.proxied() => PRIVATE,
             _ if tapped => "127.0.0.1",
             _ => self.addr().rsplit_once(':').unwrap().0,
         }
     }
-    /// `route(tap)` and the user login.
+    /// `route(tap)` and the user login (`-k` for the DC: no user, no password).
     pub fn args(self, tap: Option<&Tap>) -> Vec<String> {
         let mut v = self.route(tap);
-        v.extend(LOGIN.iter().map(|s| s.to_string()));
+        if self.kerberos() {
+            v.push("-k".into());
+        } else {
+            v.extend(LOGIN.iter().map(|s| s.to_string()));
+        }
         v
     }
 }
@@ -120,13 +160,110 @@ pub fn fast() -> Ep {
     }
 }
 
+/// The Kerberos endpoint of tests/fast.rs: `Ep::Dc`, or `Ep::DcProxied` when RSMB_TEST_VIA=socks5.
+pub fn dc() -> Ep {
+    if fast().proxied() {
+        Ep::DcProxied
+    } else {
+        Ep::Dc
+    }
+}
+
 /// Lines of the proxy's log that contain `needle` (`docker logs rsmb-socks`).
 pub fn proxy_lines(needle: &str) -> usize {
+    log_lines("rsmb-socks", needle)
+}
+
+/// Lines of the DC's log that are a TGS request of `user` from `addr`:
+/// `TGS-REQ <user>@RSMB.TEST from ipv4:<addr>:`.
+pub fn kdc_requests(user: &str, addr: &str) -> usize {
+    log_lines(
+        SAMBA_DC,
+        &format!("TGS-REQ {user}@RSMB.TEST from ipv4:{addr}:"),
+    )
+}
+
+/// A new ticket cache from the DC (`docker exec rsmb-samba-dc mkcache <flag> <user> <spns…>`),
+/// written to `dir/<name>` with mode 0600. `flag` is "-f" (forwardable) or "-F" (not).
+pub fn krb_cache(dir: &Path, name: &str, flag: &str, user: &str, spns: &[&str]) -> PathBuf {
+    use std::os::unix::fs::OpenOptionsExt;
     let o = Command::new("docker")
-        .args(["logs", "rsmb-socks"])
+        .args(["exec", SAMBA_DC, "mkcache", flag, user])
+        .args(spns)
         .output()
         .unwrap();
-    assert!(o.status.success(), "docker logs rsmb-socks");
+    assert!(
+        o.status.success() && o.stdout.starts_with(&[5, 4]),
+        "mkcache {flag} {user} {spns:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let p = dir.join(name);
+    let _ = std::fs::remove_file(&p);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&p)
+        .unwrap()
+        .write_all(&o.stdout)
+        .unwrap();
+    p
+}
+
+/// A copy of `cache` in which every ticket ended an hour ago: each run of four big-endian 32-bit
+/// times (auth, start, end, renew) that lies within three days of now gets `now - 3600` as its
+/// end. The copy is `<cache>.expired`.
+pub fn expired_copy(cache: &Path) -> PathBuf {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut b = std::fs::read(cache).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let near = |at: usize, b: &[u8]| {
+        let t = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as i64;
+        (t - now).abs() < 3 * 86_400
+    };
+    let (mut i, mut changed) = (0, 0);
+    while i + 16 <= b.len() {
+        // auth, start and end lie near now; renew is near or 0 (a TGT that is not renewable).
+        let renew = u32::from_be_bytes(b[i + 12..i + 16].try_into().unwrap());
+        if near(i, &b) && near(i + 4, &b) && near(i + 8, &b) && (renew == 0 || near(i + 12, &b)) {
+            b[i + 8..i + 12].copy_from_slice(&((now - 3600) as u32).to_be_bytes());
+            changed += 1;
+            i += 16;
+        } else {
+            i += 1;
+        }
+    }
+    assert!(changed > 0, "no ticket times found in {}", cache.display());
+    let p = cache.with_extension("expired");
+    let _ = std::fs::remove_file(&p);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&p)
+        .unwrap()
+        .write_all(&b)
+        .unwrap();
+    p
+}
+
+/// A krb5.conf in `dir` that names `kdc` for RSMB.TEST; the path, for KRB5_CONFIG.
+pub fn krb5_conf(dir: &Path, kdc: &str) -> PathBuf {
+    let p = dir.join(format!("krb5-{}.conf", kdc.replace([':', '/'], "_")));
+    std::fs::write(&p, format!("[realms]\nRSMB.TEST = {{\n  kdc = {kdc}\n}}\n")).unwrap();
+    p
+}
+
+/// Lines of `docker logs <container>` (stdout and stderr) that contain `needle`.
+fn log_lines(container: &str, needle: &str) -> usize {
+    let o = Command::new("docker")
+        .args(["logs", container])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "docker logs {container}");
     [&o.stdout[..], &o.stderr[..]]
         .iter()
         .flat_map(|b| b.split(|c| *c == b'\n'))
@@ -222,7 +359,7 @@ pub fn run_env(args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Outp
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("RSMB_HISTORY", "");
-    for (k, v) in env {
+    for (k, v) in KRB5_DEFAULTS.iter().chain(env) {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
@@ -361,45 +498,58 @@ impl Client {
     pub fn to(ep: Ep, extra: &[&str]) -> Client {
         let mut args = LOGIN.to_vec();
         args.extend(extra);
-        Client::build(ep.route(None), None, &args)
+        Client::build(ep.route(None), None, &args, &[])
+    }
+    /// A tapped Kerberos session to `ep` (`Ep::Dc` or `Ep::DcProxied`) with `-k`,
+    /// KRB5CCNAME=`cache` and `env` (KRB5_CONFIG, say).
+    pub fn kerberos(ep: Ep, cache: &Path, extra: &[&str], env: &[(&str, &str)]) -> Client {
+        let t = ep.tap();
+        let mut args = vec!["-k"];
+        args.extend(extra);
+        let cache = cache.to_str().unwrap();
+        let mut env = env.to_vec();
+        env.push(("KRB5CCNAME", cache));
+        Client::build(ep.route(Some(&t)), Some(t), &args, &env)
     }
     /// Full control: `addr` (None with a tap: the tap; None without: `args` names the host).
     pub fn with(addr: Option<&str>, tap: Option<Ep>, args: &[&str]) -> Client {
         match (tap, addr) {
             (Some(ep), _) => {
                 let t = ep.tap();
-                Client::build(ep.route(Some(&t)), Some(t), args)
+                Client::build(ep.route(Some(&t)), Some(t), args, &[])
             }
             (None, Some(a)) => {
                 let (h, p) = split(a);
-                Client::build(vec!["-H".into(), h, "-P".into(), p], None, args)
+                Client::build(vec!["-H".into(), h, "-P".into(), p], None, args, &[])
             }
-            (None, None) => Client::build(vec![], None, args),
+            (None, None) => Client::build(vec![], None, args, &[]),
         }
     }
     /// A tap in front of any address (the blackhole endpoint, which has no `Ep`).
     pub fn tapped_at(addr: &str, args: &[&str]) -> Client {
         let t = Tap::start(addr).unwrap();
         let (h, p) = split(&t.addr().to_string());
-        Client::build(vec!["-H".into(), h, "-P".into(), p], Some(t), args)
+        Client::build(vec!["-H".into(), h, "-P".into(), p], Some(t), args, &[])
     }
     /// A session whose tap the test made itself; `args` is the whole command line (route and
     /// login). The client owns the tap; `take_tap()` gives it back, and dropping it closes its port.
     pub fn through(tap: Tap, args: &[&str]) -> Client {
-        Client::build(vec![], Some(tap), args)
+        Client::build(vec![], Some(tap), args, &[])
     }
-    fn build(route: Vec<String>, tap: Option<Tap>, args: &[&str]) -> Client {
+    fn build(route: Vec<String>, tap: Option<Tap>, args: &[&str], env: &[(&str, &str)]) -> Client {
         let mut argv = route;
         argv.extend(args.iter().map(|s| s.to_string()));
         argv.extend(["--json".to_string(), "--keep-going".to_string()]);
-        let mut child = Command::new(BIN)
-            .args(&argv)
+        let mut cmd = Command::new(BIN);
+        cmd.args(&argv)
             .env("RSMB_HISTORY", "")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        for (k, v) in KRB5_DEFAULTS.iter().chain(env) {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -703,21 +853,23 @@ pub struct Pty {
 impl Pty {
     /// `args` in full (host, login); `TERM=xterm`; history in `history`.
     pub fn start(args: &[&str], history: &Path) -> Pty {
-        Pty::command(BIN, args, history)
+        Pty::command(BIN, args, history, &[])
     }
 
-    pub fn command(program: &str, args: &[&str], history: &Path) -> Pty {
-        let mut child = Command::new("python3")
-            .arg(root().join("testenv/ptyrun.py"))
+    pub fn command(program: &str, args: &[&str], history: &Path, env: &[(&str, &str)]) -> Pty {
+        let mut cmd = Command::new("python3");
+        cmd.arg(root().join("testenv/ptyrun.py"))
             .args(["200", "50", program])
             .args(args)
             .env("TERM", "xterm")
             .env("RSMB_HISTORY", history)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        for (k, v) in KRB5_DEFAULTS.iter().chain(env) {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
         let mut out = child.stdout.take().unwrap();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -1122,9 +1274,16 @@ impl Scratch {
             container: ep.container(),
             name: format!("rsmb-test-{}-{n}", std::process::id()),
         };
+        // On the DC a file written over SMB belongs to the id Samba maps the realm's user to,
+        // not to a Unix user: the directory is open to all instead.
+        let own = if ep.kerberos() {
+            "chmod 1777"
+        } else {
+            "chown tester:tester"
+        };
         docker_sh(
             s.container,
-            &format!("mkdir -p '{0}' && chown tester:tester '{0}'", s.server()),
+            &format!("mkdir -p '{0}' && {own} '{0}'", s.server()),
         );
         s
     }
@@ -1293,7 +1452,7 @@ pub fn run_in(dir: &Path, args: &[&str], stdin: Option<&str>, env: &[(&str, &str
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("RSMB_HISTORY", "");
-    for (k, v) in env {
+    for (k, v) in KRB5_DEFAULTS.iter().chain(env) {
         cmd.env(k, v);
     }
     finish_run(cmd.spawn().unwrap(), stdin, &format!("{args:?}"), t0)
@@ -1331,7 +1490,8 @@ pub fn run_sh(script: &str) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("RSMB_HISTORY", "");
+        .env("RSMB_HISTORY", "")
+        .envs(KRB5_DEFAULTS);
     finish_run(cmd.spawn().unwrap(), None, script, t0)
 }
 

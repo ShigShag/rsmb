@@ -282,7 +282,7 @@ fn sigterm_in_a_tab_on_the_wire() {
     let tap = Ep::Slow.tap();
     let route = Ep::Slow.args(Some(&tap)).join(" ");
     let script = format!("{BIN} {route}; echo EXIT=$?; stty -a; echo END");
-    let mut p = Pty::command("sh", &["-c", &script], &hist);
+    let mut p = Pty::command("sh", &["-c", &script], &hist, &[]);
     let prompt = format!("//{}> ", Ep::Slow.host(true));
     p.expect(&prompt, WAIT);
     p.line("pwd", &prompt);
@@ -1639,8 +1639,10 @@ fn no_way_around_the_proxy() {
     }
     // The loader's own log: a name lookup on this host loads a name-service module. The control
     // (direct to the name) shows that the probe can see one.
-    let nss = |args: &[&str]| {
-        let o = run_env(args, None, &[("LD_DEBUG", "files")]);
+    let nss = |args: &[&str], env: &[(&str, &str)]| {
+        let mut env = env.to_vec();
+        env.push(("LD_DEBUG", "files"));
+        let o = run_env(args, None, &env);
         o.stderr
             .lines()
             .filter(|l| l.contains("file=libnss_"))
@@ -1649,7 +1651,7 @@ fn no_way_around_the_proxy() {
     let mut control = vec!["-H", PRIVATE];
     control.extend(LOGIN);
     control.extend(["-N", "-C", "pwd"]);
-    let seen = nss(&control);
+    let seen = nss(&control, &[]);
     if seen == 0 {
         println!("leak probe blind on this host");
     } else {
@@ -1657,9 +1659,37 @@ fn no_way_around_the_proxy() {
         proxied.extend(LOGIN);
         proxied.extend(["-N", "-C", "use share", "-C", "ls /sizes"]);
         assert_eq!(
-            nss(&proxied),
+            nss(&proxied, &[]),
             0,
             "a name-service module was loaded through the proxy (the control loaded {seen})"
+        );
+        // Kerberos with a TGT only: neither the server's name nor the KDC's (the realm's name,
+        // rsmb.test) is looked up on this host (docs/plans/stage-5.md, S64).
+        let dir = tmp("no_way_around_the_proxy");
+        let tgt = krb_cache(&dir, "tgt.cc", "-f", "tester", &[]);
+        let env = [
+            ("KRB5CCNAME", tgt.to_str().unwrap()),
+            ("KRB5_CONFIG", "/dev/null"),
+        ];
+        let kerberos = [
+            "--proxy",
+            &url,
+            "-H",
+            DC_NAME,
+            "-k",
+            "-N",
+            "-C",
+            "use share",
+            "-C",
+            "ls /",
+        ];
+        let o = run_env(&kerberos, None, &env);
+        assert_eq!(o.code, 0, "Kerberos through the proxy: {}", o.stderr);
+        assert_eq!(
+            nss(&kerberos, &env),
+            0,
+            "a name-service module was loaded in a Kerberos login through the proxy (the \
+             control loaded {seen})"
         );
     }
 }
@@ -1854,5 +1884,265 @@ fn signals_through_the_proxy() {
             "no",
             "{what}: nothing under the final name on the server"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 5: Kerberos (docs/plans/stage-5.md 7.4)
+
+/// Until the KDC's log has `want` TGS requests of `user` from `addr` (it is written as the KDC
+/// answers), then exactly that many.
+fn expect_kdc_requests(user: &str, addr: &str, want: usize, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while kdc_requests(user, addr) < want && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        kdc_requests(user, addr),
+        want,
+        "{what}: TGS requests of {user} from {addr} in the KDC's log"
+    );
+}
+
+/// One-shot `-k` run: `args`, KRB5CCNAME=`cache`, KRB5_CONFIG=`conf`.
+fn run_k(args: &[&str], cache: &Path, conf: &str) -> Output {
+    let mut a = args.to_vec();
+    a.extend(["-k", "-N"]);
+    run_env(
+        &a,
+        None,
+        &[
+            ("KRB5CCNAME", cache.to_str().unwrap()),
+            ("KRB5_CONFIG", conf),
+        ],
+    )
+}
+
+/// S71: with a TGT only, the KDC is asked once per login: direct from this host (the control:
+/// the probe can see), through the proxy only from the proxy's address, also with a KDC the host
+/// reaches directly, by address or by the realm's name; with the service ticket not at all. The
+/// users kdirect and kproxy belong to this test alone.
+#[test]
+fn kerberos_kdc_is_asked_through_the_proxy() {
+    let dir = tmp("kerberos_kdc_is_asked_through_the_proxy");
+    let conf = krb5_conf(&dir, DC);
+    let conf = conf.to_str().unwrap();
+    let kdirect = krb_cache(&dir, "kdirect.cc", "-f", "kdirect", &[]);
+    let kproxy = krb_cache(&dir, "kproxy.cc", "-f", "kproxy", &[]);
+    let kproxy_svc = krb_cache(
+        &dir,
+        "kproxy-svc.cc",
+        "-f",
+        "kproxy",
+        &["cifs/dc.rsmb.test"],
+    );
+    let ls = ["-C", "use share", "-C", "ls /"];
+    let (host, proxy) = ("10.213.45.1", "10.213.45.20");
+
+    let before = kdc_requests("kdirect", host);
+    let mut a = vec!["-H", DC];
+    a.extend(ls);
+    let o = run_k(&a, &kdirect, conf);
+    assert_eq!(o.code, 0, "direct: {}", o.stderr);
+    expect_kdc_requests("kdirect", host, before + 1, "the control, direct");
+
+    // The log is the container's whole log: what counts is that nothing is added to it.
+    let around = kdc_requests("kproxy", host);
+    let mut n = kdc_requests("kproxy", proxy);
+    for (url, conf, line) in [
+        (
+            "socks5://10.213.45.20:1080",
+            conf,
+            "connected to 10.213.45.12:88",
+        ),
+        (
+            "socks5://10.213.45.20:1080",
+            "/dev/null",
+            "connected to rsmb.test:88",
+        ),
+        (
+            "socks5://tester:testpass@10.213.45.20:1081",
+            conf,
+            "connected to 10.213.45.12:88",
+        ),
+    ] {
+        let lines = proxy_lines(line);
+        let mut a = vec!["--proxy", url, "-H", DC_NAME];
+        a.extend(ls);
+        let o = run_k(&a, &kproxy, conf);
+        assert_eq!(o.code, 0, "{url} {conf}: {}", o.stderr);
+        n += 1;
+        expect_kdc_requests("kproxy", proxy, n, &format!("{url} {conf}: from the proxy"));
+        assert_eq!(
+            kdc_requests("kproxy", host),
+            around,
+            "{url} {conf}: around the proxy"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while proxy_lines(line) <= lines && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            proxy_lines(line) > lines,
+            "{url} {conf}: the proxy's log lacks {line:?}"
+        );
+    }
+    // With the service ticket in the cache the KDC is not asked.
+    let mut a = vec!["--proxy", "socks5://10.213.45.20:1080", "-H", DC_NAME];
+    a.extend(ls);
+    let o = run_k(&a, &kproxy_svc, "/dev/null");
+    assert_eq!(o.code, 0, "service ticket: {}", o.stderr);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        kdc_requests("kproxy", proxy),
+        n,
+        "service ticket: the KDC was asked"
+    );
+    assert_eq!(
+        kdc_requests("kproxy", host),
+        around,
+        "around the proxy, at the end"
+    );
+}
+
+/// One case of `kerberos_failures`: what, arguments, cache, KRB5_CONFIG, kind, words in the
+/// message, at most so many seconds.
+type KCase<'a> = (
+    &'a str,
+    Vec<&'a str>,
+    &'a Path,
+    &'a str,
+    &'a str,
+    Vec<String>,
+    u64,
+);
+
+/// S72: the KDC's failures in our words, each of the kind a script acts on: `connect` when the
+/// KDC could not be asked, `auth` when it or the server refused.
+#[test]
+fn kerberos_failures() {
+    let dir = tmp("kerberos_failures");
+    let conf = krb5_conf(&dir, DC);
+    let conf = conf.to_str().unwrap();
+    let no88 = krb5_conf(&dir, "10.213.45.10");
+    let no88 = no88.to_str().unwrap();
+    let nosuch = krb5_conf(&dir, "nosuch.rsmb.test");
+    let absent = krb5_conf(&dir, "10.213.47.99");
+    let tgt = krb_cache(&dir, "tgt.cc", "-f", "tester", &[]);
+    let samba_ticket = krb_cache(&dir, "samba.cc", "-f", "tester", &["cifs/10.213.45.10"]);
+    let via1080 = ["--proxy", "socks5://10.213.45.20:1080", "-H", DC_NAME];
+    let cases: Vec<KCase> = vec![
+        (
+            "a KDC with port 88 closed",
+            vec!["-H", DC],
+            &tgt,
+            no88,
+            "connect",
+            vec![
+                "Kerberos: asking the KDC 10.213.45.10:88".into(),
+                "refused".into(),
+                no88.into(),
+            ],
+            2,
+        ),
+        (
+            "no kdc in the files: the realm's name, which the host cannot resolve",
+            vec!["-H", DC],
+            &tgt,
+            "/dev/null",
+            "connect",
+            vec![
+                "KDC rsmb.test:88".into(),
+                "so the realm's name was tried".into(),
+                "KRB5_CONFIG".into(),
+                "kvno cifs/10.213.45.12".into(),
+            ],
+            12,
+        ),
+        (
+            "an SPN the realm does not know",
+            vec!["-H", "10.213.45.11"],
+            &tgt,
+            conf,
+            "auth",
+            vec!["has no service cifs/10.213.45.11".into()],
+            12,
+        ),
+        (
+            "a valid ticket at a server that does no Kerberos",
+            vec!["-H", "10.213.45.10"],
+            &samba_ticket,
+            conf,
+            "auth",
+            vec!["did not accept the ticket".into()],
+            12,
+        ),
+        (
+            "through the proxy to a KDC name it cannot resolve",
+            via1080.to_vec(),
+            &tgt,
+            nosuch.to_str().unwrap(),
+            "connect",
+            vec![
+                "Kerberos: asking the KDC nosuch.rsmb.test:88".into(),
+                "proxy 10.213.45.20:1080: cannot reach nosuch.rsmb.test:88".into(),
+            ],
+            12,
+        ),
+        (
+            "through the proxy to a KDC address that is not there",
+            via1080.to_vec(),
+            &tgt,
+            absent.to_str().unwrap(),
+            "connect",
+            vec![
+                "Kerberos: asking the KDC 10.213.47.99:88".into(),
+                "proxy 10.213.45.20:1080: cannot reach 10.213.47.99:88".into(),
+            ],
+            12,
+        ),
+        (
+            "a closed proxy port, with a server and a KDC the host reaches directly",
+            vec!["--proxy", "socks5://10.213.45.20:1082", "-H", DC],
+            &tgt,
+            conf,
+            "connect",
+            vec!["proxy 10.213.45.20:1082".into()],
+            12,
+        ),
+    ];
+    for (what, args, cache, conf, kind, words, within) in &cases {
+        for json in [true, false] {
+            let mut a = args.clone();
+            a.extend(["-C", "use share"]);
+            if json {
+                a.push("--json");
+            }
+            let o = run_k(&a, cache, conf);
+            assert_eq!(o.code, 3, "{what}, json {json}: {} {}", o.stdout, o.stderr);
+            assert!(
+                o.took <= Duration::from_secs(*within),
+                "{what}: took {:?}",
+                o.took
+            );
+            let m = if json {
+                let v = o.json();
+                assert_eq!(v.len(), 1, "{what}: one error and no done: {}", o.stdout);
+                assert_eq!(v[0]["type"], "error", "{what}");
+                assert_eq!(v[0]["command"], serde_json::Value::Null, "{what}");
+                assert_eq!(v[0]["kind"], *kind, "{what}: {}", o.stdout);
+                v[0]["message"].as_str().unwrap().to_string()
+            } else {
+                o.stderr.clone()
+            };
+            for w in words {
+                assert!(m.contains(w.as_str()), "{what}: {w:?} not in {m}");
+            }
+            if json
+                && *what == "a closed proxy port, with a server and a KDC the host reaches directly"
+            {
+                assert!(m.starts_with("proxy 10.213.45.20:1082"), "{m}");
+            }
+        }
     }
 }

@@ -257,8 +257,9 @@ if [ "$REPS" = 0 ]; then
     wait "$TAP_PID" 2>/dev/null || true
     rm -rf "$work/smallfiles"
 
-    # 4. get -r /tree at slow (two items are denied, so the run exits 1: -k, and the summary).
-    s=$({ "$RSMB" -H "$SLOW" "${LOGIN[@]}" --json -N -k -C 'use share' -C "lcd $work" \
+    # 4. get -r /tree at slow (two items are denied, so the run exits 1: --keep-going, and the
+    # summary).
+    s=$({ "$RSMB" -H "$SLOW" "${LOGIN[@]}" --json -N --keep-going -C 'use share' -C "lcd $work" \
         -C 'get -r -f /tree' || true; } | jq -r 'select(.type == "summary") | .seconds')
     printf "$fmt" slow "get -r /tree (341 dirs, 2 denied)" "$s" - \
         "23 waves + 22 x 1 rt = $(waves 45) s"

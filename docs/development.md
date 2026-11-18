@@ -15,6 +15,20 @@ target/release/rsmb --proxy socks5://10.213.45.20:1080 -H fileserver.rsmb.test \
 target/release/rsmb --help-all              # the manual, no server needed
 ```
 
+A Kerberos login by hand, with a cache only you can read and without the host's Kerberos
+configuration (the service ticket is in the cache, so no KDC is asked):
+
+```
+(umask 077; docker exec rsmb-samba-dc mkcache -f tester cifs/10.213.45.12 > "$XDG_RUNTIME_DIR/rsmb-k.cc")
+KRB5_CONFIG=/dev/null KRB5CCNAME="$XDG_RUNTIME_DIR/rsmb-k.cc" target/release/rsmb -k -H 10.213.45.12
+```
+
+With a ticket-granting ticket only (`mkcache -f tester` without a service name) the KDC must be
+named, because the host cannot resolve the realm's name `rsmb.test`: a file with `[realms]`,
+`RSMB.TEST = {`, `kdc = 10.213.45.12`, `}` in `KRB5_CONFIG`. Through the proxy
+(`--proxy socks5://10.213.45.20:1080 -H dc.rsmb.test`) `KRB5_CONFIG=/dev/null` works: the proxy
+resolves `rsmb.test`.
+
 The workspace has two members: the root package `rsmb` and `smbtap` (the counting tap, a
 dev-dependency of the tests). `spikes/` is excluded and has its own lock files.
 
@@ -24,7 +38,7 @@ dev-dependency of the tests). `spikes/` is excluded and has its own lock files.
 ./test.sh fast     # environment, check.sh, fmt, clippy, build, unit tests, tests/fast direct
                    # and again through the proxy                       (budget 150 s, about 60 s)
 ./test.sh          # the same plus tests/slow, tests/serial, smbtap against tshark
-                   #                                                    (budget 600 s, about 7.5 min)
+                   #                                                    (budget 600 s, about 8 min)
 ```
 
 One test: `cargo test --bin rsmb listing_plan` (a unit test, dev profile) or
@@ -58,8 +72,8 @@ stderr.
   with the syntax and every example. `table_is_complete`, `help_all_has_everything`,
   `docs_match_the_table` and `examples_run` fail until all of that is there.
 - **Printing names.** `Out::text` escapes control and bidi characters (`safe`): use it for every
-  line that can hold a name or a message. `Out::doc` writes our own fixed text unchanged (the
-  manual and the help, which have several lines). A new printer that writes to stdout or stderr
+  line that can hold a name or a message. `Out::doc` writes our own fixed text unescaped (the
+  manual and the help, which have several lines), wrapped at spaces to 80 columns (`wrap`). A new printer that writes to stdout or stderr
   by another way calls `safe` on what it prints; `--json` and `cat` never do.
 - A method of `Session` that sends starts with `self.tree(..)` (which reconnects a dead
   connection) and sets `in_flight` around its requests, so an interrupt replaces the connection.
@@ -79,11 +93,17 @@ stderr.
   in `find`'s syntax, flags and `docs/commands.md` section.
 - A new test in **`tests/fast.rs`** names its endpoint as `fast()` and uses its methods
   (`route`, `args`, `host`, `container`, `tap`), never an address, a prompt with an address or
-  the name `rsmb-samba`: the file runs twice, the second time through the proxy. A test that
+  the name `rsmb-samba`: the file runs twice, the second time through the proxy. A Kerberos test
+  names `dc()` and its `spn(tapped)` the same way; a direct TGT-only run names the KDC with
+  `krb5_conf(dir, "10.213.45.12")`, and a tapped Kerberos session through the proxy holds the
+  service ticket (`docs/testing.md`, "The harness"). A test that
   passes its own `--proxy` builds its whole command line and does not add to `route()`
   (`docs/testing.md`).
 - A new **start-up flag** goes into `Args` in `src/main.rs` with a doc comment; the manual renders
-  it from clap, and `docs_match_the_table` wants its long name in `docs/commands.md`.
+  it from clap, and `docs_match_the_table` wants its long name in `docs/commands.md`. The doc
+  comment's first paragraph is what `--help` shows: one short line, so that the line stays within
+  80 columns (`args_are_sound` checks it); details go into a second paragraph, which only the
+  manual shows, joined to the first by "; ".
 - A new **JSON object type** goes into `JSON_OBJECTS` in `src/commands.rs`;
   `every_json_line_has_a_type` fails for a type that is printed but not listed.
 
@@ -100,13 +120,16 @@ for reading.
 `smb2`, `tokio`, `async-trait` (the crate's transport traits), `tokio-socks`, `libc` (the terminal's
 attributes, restored on SIGTERM in the shell; `O_NOFOLLOW` for the local temporary file), `clap` (without
 default features), `rustyline` (with file history only), `serde_json`, `rpassword`; dev:
-`smbtap`. Stages 2 to 4 added none (`tokio-socks` does the SOCKS5 handshake since Stage 1; the
+`smbtap`. Stages 2 to 5 added none (`tokio-socks` does the SOCKS5 handshake since Stage 1; the
 master plan's `indicatif` was never added): no progress-bar crate (one line of our own), no hashing
 crate (FNV-1a in ten lines), tokio's `fs` feature not enabled (local I/O is `std::fs` on the main
 thread or in `spawn_blocking`), no glob crate (`Glob` in `src/walk.rs`, about 150 lines with its
 classes and folding, compared with the server's `find` on 60 patterns). No PTY, time, temp-file, URL or regex crate: the tests use `testenv/ptyrun.py`,
-`env!("CARGO_TARGET_TMPDIR")` and a few lines of their own. A new dependency needs a line of
-justification in the stage plan.
+`env!("CARGO_TARGET_TMPDIR")` and a few lines of their own. No Kerberos crate and no system
+Kerberos library: `smb2` parses the cache and does the Kerberos exchange; rsmb adds the cache's
+path, its owner (`libc::getuid`), the expiry check, a small `krb5.conf` reader and the KDC relay
+(tokio's UDP socket and `open_tcp`). A new dependency needs a line of justification in the stage
+plan.
 
 ## Throwaway measurements
 

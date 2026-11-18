@@ -6,7 +6,8 @@ single compound open/close for `cd`, a directory listing in one compound, cached
 listings for Tab completion, nothing sent between commands, transfers and walks that keep up to
 16 requests in flight.
 
-**Status: all four stages are done.** Login (user/password/domain, guest, anonymous), an
+**Status: all five stages are done.** Login (user/password/domain, guest, anonymous, and
+Kerberos from the ticket cache with `-k`, direct and through the proxy, the KDC included), an
 interactive shell with history and completion (remote and local paths), a non-interactive mode
 with `--json` and fixed exit codes, the commands `shares` (with the share-level access the
 server reports for each share, one more round trip), `use`, `cd`, `pwd`, `ls`, `tree`
@@ -28,6 +29,12 @@ Three uses, each checked:
 - **Developed by AI end to end**: `./test.sh` brings up the containers, checks them and runs every
   test without root and without a human step.
 
+**`-k` is Kerberos now; it used to be the short form of `--keep-going`**, which keeps only its long
+form. An old command line with `-k` and `-p` or `--no-pass` is now refused (exit 2); one without
+either (an anonymous run such as `rsmb -H h -N -k -C ls`, or one that waited for the password
+prompt) is now a Kerberos login as the principal of the default ticket cache. Write
+`--keep-going`.
+
 ## Install
 
 ```
@@ -36,9 +43,9 @@ cargo install --git https://github.com/ShigShag/rsmb rsmb
 
 The repository holds two packages (`rsmb` and the test tool `smbtap`), so the package is named; the
 binary is `rsmb`. It needs a recent stable Rust (edition 2024; `File::try_lock` is used, stable
-since Rust 1.89; built and tested with 1.99) and no system library. `cargo install --locked
---git … rsmb` builds with the committed `Cargo.lock`, which is the set of versions the tests ran
-with.
+since Rust 1.89; built and tested with 1.99) and no system library (no Kerberos library either).
+`cargo install --locked --git https://github.com/ShigShag/rsmb rsmb` builds with the committed
+`Cargo.lock`, which is the set of versions the tests ran with.
 
 ## Using it
 
@@ -71,12 +78,17 @@ target/release/rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM -C 'use sha
 target/release/rsmb --proxy socks5://tester:testpass@10.213.45.20:1081 -H fileserver.rsmb.test \
     -u tester -p testpass -d TESTDOM -C 'use share' -C 'ls /sizes'
 
+# Kerberos from the ticket cache (KRB5CCNAME, else /tmp/krb5cc_<uid>): no password; the
+# ticket-granting ticket must be forwardable (kinit -f), or the service ticket in the cache
+kinit -f alice@CORP.EXAMPLE
+target/release/rsmb -k -H fs1.corp.example -N -C 'use docs' -C 'ls'
+
 # the whole manual, no server needed
 target/release/rsmb --help-all
 ```
 
-[`docs/commands.md`](docs/commands.md) has every command and flag (and the proxy's rules and
-messages), [`docs/scripting.md`](docs/scripting.md) the non-interactive contract and the `--json`
+[`docs/commands.md`](docs/commands.md) has every command and flag (and the proxy's and
+Kerberos' rules and messages), [`docs/scripting.md`](docs/scripting.md) the non-interactive contract and the `--json`
 objects, [`docs/transfers.md`](docs/transfers.md) every rule a transfer keeps.
 
 ## Against smbclient-ng
@@ -136,20 +148,22 @@ listings (TCP slow start fits the numbers).
 
 Needs Docker with Compose, bash, python3, `smbclient`, `iperf3`, `jq`, and for the full run
 `tshark` and `dumpcap` usable without root. No root and no host changes: everything privileged
-runs inside containers (Samba ×3, two latency routers, a SOCKS5 proxy in front of a server the
-host cannot reach).
+runs inside containers, seven of them (Samba ×3, two latency routers, a SOCKS5 proxy in front of a
+server the host cannot reach, and a Samba AD domain controller with its own KDC for Kerberos).
 
 ```
-./testenv/up.sh      # build and start: 68 s from nothing (6 GB image), 4.6-4.7 s with the images built
+./testenv/up.sh      # build and start: about 150 s from nothing (6 GB image and the DC's 219 MB), seconds with the images built
 ./testenv/check.sh   # verify the environment with independent tools (about 30 s)
-./test.sh            # everything: 456 s counted of the 600 s budget (about 7.5 min)
-./test.sh fast       # up to tests/fast, direct and through the proxy: about 57 s of 150
+./test.sh            # everything: 477 s counted of the 600 s budget (about 8 min)
+./test.sh fast       # up to tests/fast, direct and through the proxy: about 62 s of 150
 ./testenv/down.sh    # stop and remove containers and networks
 ```
 
 Samba is at 10.213.45.10 (direct) and 10.213.45.30 (through a router adding 100 ms each way),
 user `TESTDOM\tester`, password `testpass`; the proxy at 10.213.45.20 (port 1080 without a login,
-1081 with `tester`/`testpass`), the private server behind it as `fileserver.rsmb.test`.
+1081 with `tester`/`testpass`), the private server behind it as `fileserver.rsmb.test`; the
+Kerberos server at 10.213.45.12 (realm `RSMB.TEST`, `dc.rsmb.test` through the proxy), whose
+ticket caches the tests make with `docker exec rsmb-samba-dc mkcache -f tester …`.
 
 ## Documentation
 

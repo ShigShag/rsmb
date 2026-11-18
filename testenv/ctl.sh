@@ -6,7 +6,8 @@
 #   ctl.sh conns-reset <service>   set that count to zero
 #   ctl.sh drops                   packets netem on wan has dropped so far (fails if wan cannot be asked)
 #   ctl.sh pause|unpause <service> freeze the server: TCP is accepted, nothing answers
-# <service> is samba, samba-edge or samba-private (pause also takes wan, wan-bad, socks).
+# <service> is samba, samba-edge or samba-private (pause also takes wan, wan-bad, socks, samba-dc;
+# the DC has no connection counter, so conns and evict do not apply to it).
 set -euo pipefail
 
 rule=(FORWARD -p tcp -m conntrack --ctorigdstport 4450 -j DROP)
@@ -30,6 +31,6 @@ case "${1:-} ${2:-}" in
     "pause "?* | "unpause "?*)
         docker "$1" "rsmb-$2" >/dev/null ;;
     *)
-        sed -n '2,9p' "$0" >&2
+        sed -n '2,10p' "$0" >&2
         exit 2 ;;
 esac

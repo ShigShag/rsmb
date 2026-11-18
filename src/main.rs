@@ -22,8 +22,10 @@ use commands::Out;
 use session::{Error, Kind, Session, Target};
 
 /// rsmb: a fast SMB shell client. 'rsmb --help-all' prints the whole manual.
+// `--help` shows each flag's first paragraph, one line within 80 columns; the manual (`options`)
+// shows the whole text, the paragraphs joined by "; ".
 #[derive(Parser, Debug)]
-#[command(name = "rsmb", version)]
+#[command(name = "rsmb", version, disable_help_flag = true)]
 pub struct Args {
     /// Server name or address
     #[arg(
@@ -36,50 +38,80 @@ pub struct Args {
     /// Server port
     #[arg(short = 'P', long, value_name = "PORT", default_value_t = 445)]
     port: u16,
-    /// User name (empty: anonymous; Guest: guest). DOMAIN\user is split unless -d is given
-    #[arg(short = 'u', long, value_name = "USER", default_value = "")]
+    /// User (empty: anonymous; Guest: guest)
+    ///
+    /// DOMAIN\user is split unless -d is given; with -k: optional, must match the ticket cache
+    #[arg(
+        short = 'u',
+        long,
+        value_name = "USER",
+        default_value = "",
+        hide_default_value = true
+    )]
     user: String,
-    /// Domain or workgroup
+    /// Domain or workgroup; with -k: the realm
     #[arg(short = 'd', long, value_name = "DOMAIN")]
     domain: Option<String>,
-    /// Password (visible in the process list; without it rsmb prompts on a terminal)
+    /// Password (else asked for on a terminal)
+    ///
+    /// visible in the process list
     #[arg(short = 'p', long, value_name = "PASSWORD", conflicts_with = "no_pass")]
     password: Option<String>,
     /// Use an empty password and never prompt
     #[arg(long)]
     no_pass: bool,
-    /// Connect through a SOCKS5 proxy: socks5://[user:pass@]host:port (the proxy resolves the
-    /// server's name; percent-encode special characters in user and password; IPv6 proxy in
-    /// brackets; visible in the process list)
+    /// Kerberos login from the ticket cache
+    ///
+    /// KRB5CCNAME, or /tmp/krb5cc_<uid>: no password, never a prompt; user and realm come from
+    /// the cache (-u and -d, if given, must match it). Not with -p or --no-pass. (-k used to be
+    /// the short form of --keep-going)
+    #[arg(short = 'k', long, conflicts_with_all = ["password", "no_pass"])]
+    kerberos: bool,
+    /// Connect through socks5://[user:pass@]host:port
+    ///
+    /// the proxy resolves the server's name; percent-encode special characters in user and
+    /// password; IPv6 proxy in brackets; visible in the process list
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,
-    /// Response deadline in seconds; a silent server fails a request after between this and
-    /// max(this, 15 s), one reply must be complete within 6 times this; connecting has its own
-    /// 10 s, through a proxy too, which this does not change
+    /// Response deadline in seconds
+    ///
+    /// a silent server fails a request after between this and max(this, 15 s), one reply must
+    /// be complete within 6 times this; connecting has its own 10 s, through a proxy too, which
+    /// this does not change
     #[arg(long, value_name = "SECONDS", default_value_t = 30,
           value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
     /// Run the commands in FILE (one per line) first
     #[arg(short = 'S', long = "startup-script", value_name = "FILE")]
     startup_script: Option<PathBuf>,
-    /// Run one command line (repeatable, in order, after -S)
+    /// Run one command line (repeatable, after -S)
+    ///
+    /// the lines run in the order given
     #[arg(short = 'C', long = "command", value_name = "LINE")]
     command: Vec<String>,
     /// No interactive shell after the commands
     #[arg(short = 'N', long = "not-interactive")]
     not_interactive: bool,
-    /// Do not stop at the first failing command; exit with the first failure's code
-    #[arg(short = 'k', long = "keep-going")]
+    /// Do not stop at the first failing command
+    ///
+    /// exit with the first failure's code
+    #[arg(long = "keep-going")]
     keep_going: bool,
     /// One JSON object per stdout line
     #[arg(long)]
     json: bool,
-    /// Print the complete manual (as JSON with --json) and exit; needs no server
+    /// Print the whole manual and exit
+    ///
+    /// as JSON with --json; needs no server
     #[arg(long)]
     help_all: bool,
+    /// Print help (the whole manual: --help-all)
+    #[arg(short = 'h', long, action = clap::ArgAction::HelpShort)]
+    help: Option<bool>,
 }
 
-/// Every start-up flag as (`-H, --host <HOST>`, help), from clap's own metadata.
+/// Every start-up flag as (`-H, --host <HOST>`, help), from clap's own metadata: the whole help,
+/// its paragraphs joined by "; " (`--help` shows only the first).
 pub fn options() -> Vec<(String, String)> {
     let mut cmd = Args::command();
     cmd.build();
@@ -102,7 +134,11 @@ pub fn options() -> Vec<(String, String)> {
                     flag.push_str(&format!(" <{n}>"));
                 }
             }
-            let mut help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            let mut help = a
+                .get_long_help()
+                .or(a.get_help())
+                .map(|h| h.to_string().replace("\n\n", "; "))
+                .unwrap_or_default();
             if a.get_action().takes_values() {
                 for d in a.get_default_values().iter().filter(|d| !d.is_empty()) {
                     help.push_str(&format!(" [default: {}]", d.to_string_lossy()));
@@ -147,7 +183,7 @@ fn interruptible<F: Future>(rt: &Runtime, work: F) -> Option<F::Output> {
 /// Runs one line on the runtime; an interrupt drops the command, then the cleanup of what it
 /// left runs (itself interruptible) before the error is printed. `BUSY` is held from before the
 /// command until after the cleanup, so a signal in between cannot exit past it. A stdout that
-/// cannot be written ends the run here, with exit code 1, whatever `-k` says.
+/// cannot be written ends the run here, with exit code 1, whatever `--keep-going` says.
 pub fn run_blocking(
     rt: &Runtime,
     sess: &mut Session,
@@ -296,7 +332,11 @@ fn main() {
         (None, Some((d, u))) => (u.to_string(), d.to_string()),
         (d, _) => (args.user.clone(), d.clone().unwrap_or_default()),
     };
-    let password = match (&args.password, args.no_pass || user.is_empty()) {
+    // -k never asks for a password: the ticket cache is the credential.
+    let password = match (
+        &args.password,
+        args.kerberos || args.no_pass || user.is_empty(),
+    ) {
         (Some(p), _) => p.clone(),
         (None, true) => String::new(),
         (None, false) if stdin_tty => {
@@ -328,6 +368,7 @@ fn main() {
         domain,
         proxy,
         timeout: Duration::from_secs(args.timeout),
+        kerberos: args.kerberos,
     };
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -429,6 +470,21 @@ mod tests {
         assert_eq!(a.user.split_once('\\'), Some(("TESTDOM", "tester")));
         let a = Args::try_parse_from(["rsmb", "-H", "h", "-C", "pwd", "-C", "ls"]).unwrap();
         assert_eq!(a.command, ["pwd", "ls"]);
+        // -k is Kerberos; --keep-going has no short form.
+        let a = Args::try_parse_from(["rsmb", "-H", "h", "-k"]).unwrap();
+        assert!(a.kerberos && !a.keep_going);
+        assert!(Args::try_parse_from(["rsmb", "-H", "h", "-k", "-p", "x"]).is_err());
+        assert!(Args::try_parse_from(["rsmb", "-H", "h", "-k", "--no-pass"]).is_err());
+        let a = Args::try_parse_from(["rsmb", "-H", "h", "-k", "-u", "u", "-d", "D"]).unwrap();
+        assert!(a.kerberos && a.user == "u" && a.domain.as_deref() == Some("D"));
+        let a = Args::try_parse_from(["rsmb", "-H", "h", "--keep-going"]).unwrap();
+        assert!(a.keep_going && !a.kerberos);
+        // --help (and -h) is the short help, every line within 80 columns
+        let help = Args::command().render_help().to_string();
+        for line in help.lines() {
+            assert!(line.chars().count() <= commands::WIDTH, "{line}");
+        }
+        assert!(help.contains("-k, --kerberos") && !help.contains("KRB5CCNAME"));
         let opts = options();
         let manual = crate::commands::tests::rendered(false);
         for a in Args::command().get_arguments() {
@@ -458,6 +514,13 @@ mod tests {
             }
             if flag.contains("--port") {
                 assert!(help.ends_with("[default: 445]"), "{help}");
+            }
+            if flag.contains("--kerberos") {
+                assert!(flag.starts_with("-k, "), "{flag}");
+                assert!(help.contains("KRB5CCNAME"), "{help}");
+            }
+            if flag.contains("--keep-going") {
+                assert_eq!(flag, "--keep-going", "no short form");
             }
             if flag.contains("--timeout") {
                 assert!(help.ends_with("[default: 30]"), "{help}");
