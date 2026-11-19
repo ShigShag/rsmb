@@ -54,7 +54,7 @@ fn help_all_needs_no_server() {
     assert_eq!(o.code, 0, "{}", o.stderr);
     for name in [
         "shares", "use", "cd", "pwd", "ls", "tree", "find", "get", "put", "cat", "mkdir", "rm",
-        "rmdir", "lcd", "lpwd", "lls", "refresh", "help", "exit",
+        "rmdir", "lcd", "lpwd", "lls", "refresh", "help", "exit", "access",
     ] {
         assert!(o.stdout.contains(&format!("\n{name}")), "{name} missing");
     }
@@ -66,7 +66,7 @@ fn help_all_needs_no_server() {
         .filter(|v| v["type"] == "command")
         .map(|v| v["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 19, "{names:?}");
+    assert_eq!(names.len(), 20, "{names:?}");
 }
 
 /// A flag error is one JSON `error` object of kind `usage` with --json, clap's text without it.
@@ -4404,4 +4404,998 @@ fn kerberos_banner() {
     assert_eq!(t.contains("through proxy"), ep.proxied(), "{t}");
     p.send(b"exit\r");
     assert_eq!(p.exit_code(WAIT), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 6: access, and the check of a large put (docs/plans/stage-6.md 7.4)
+
+/// The local files the Stage 6 tests put: `notes.txt` (6 bytes) and `big.bin` (300,000 bytes, so
+/// the stream path with its check).
+fn stage6_local(dir: &std::path::Path) {
+    std::fs::write(dir.join("notes.txt"), b"notes\n").unwrap();
+    make_file(&dir.join("big.bin"), 300_000, 6);
+}
+
+/// F87: the check before a large put asks for FILE_READ_ATTRIBUTES only (A14): every effect of
+/// docs/plans/stage-6.md 2.13 on a file and a directory the user may not read.
+#[test]
+fn put_over_a_file_without_synchronize() {
+    let dir = tmp("put_over_a_file_without_synchronize");
+    stage6_local(&dir);
+    let s = Scratch::new(fast());
+    posix_fixture(&s);
+    let srv = |n: &str| format!("{}/{n}", s.server());
+    let mut c = tapped_in(&dir, Some(&s.remote()));
+    // root's 0600 file in tester's directory: replaceable, not readable (mask RA DE)
+    let r = c.cmd("put -f big.bin big.bin");
+    r.expect_ok("put -f big.bin big.bin (before A14: access_denied by the check)");
+    assert_eq!(
+        server_sha(samba(), &srv("big.bin")),
+        local_sha(&dir.join("big.bin"))
+    );
+    assert_eq!(
+        (count(r.stats(), "CREATE"), count(r.stats(), "CLOSE")),
+        (3, 3),
+        "the check (CREATE + CLOSE), the writer, the rename, as transfer_costs counts\n{}",
+        context(r.stats())
+    );
+    // no -f over root's 0600 file: it exists (before A14: access_denied)
+    let old = server_sha(samba(), &srv("secret.txt"));
+    let r = c.cmd("put big.bin secret.txt");
+    assert_eq!(r.kind().as_deref(), Some("already_exists"), "{:?}", r.lines);
+    let m = r.of("error")[0]["message"].as_str().unwrap().to_string();
+    assert!(m.contains("-f replaces it"), "{m}");
+    assert_eq!(server_sha(samba(), &srv("secret.txt")), old);
+    // root's 0700 directory: found to be a directory on both paths (before A14: already_exists
+    // on the small path, access_denied on the large one)
+    for src in ["notes.txt", "big.bin"] {
+        let r = c.cmd(&format!("put {src} rootdir700"));
+        assert_eq!(
+            r.kind().as_deref(),
+            Some("is_a_directory"),
+            "put {src} rootdir700: {:?}",
+            r.lines
+        );
+        let m = r.of("error")[0]["message"].as_str().unwrap().to_string();
+        assert!(m.contains("write '") && m.contains("rootdir700/'"), "{m}");
+    }
+    no_temps(&s, &dir);
+}
+
+/// F84: what `access` costs: the path and its directory in one compound, the cascade and its
+/// retries, `-e` as a listing plus 16 paths per compound; `ls` and `cd` cost what they did.
+#[test]
+fn access_costs() {
+    let s = Scratch::new(fast());
+    posix_fixture(&s);
+    let mut c = Client::tapped(fast());
+    c.cmd("use share").expect_ok("use share");
+    let sr = s.remote();
+    let r = c.cmd("access");
+    r.expect_ok("access at the root");
+    r.expect("access at the root: CREATE + CLOSE", 2, 1);
+    let r = c.cmd("access upload");
+    r.expect_ok("access upload");
+    r.expect("access upload: the root and upload in one compound", 4, 1);
+    let r = c.cmd("access nosuch");
+    assert_eq!(r.kind().as_deref(), Some("not_found"), "{:?}", r.lines);
+    r.expect("access nosuch", 4, 1);
+    let r = c.cmd("access nosuch/x");
+    assert_eq!(r.kind().as_deref(), Some("not_found"), "{:?}", r.lines);
+    r.expect(
+        "access nosuch/x: x asked again after its parent failed",
+        6,
+        2,
+    );
+    // Samba lists nothing in a directory it may read but not traverse (it cannot look at the
+    // entries): the listing and the directory's own probe (deviation 1 of the Stage 6 plan).
+    let r = c.cmd(&format!("access -e {sr}/listonly"));
+    r.expect_ok("access -e listonly");
+    r.expect("access -e listonly: 5 + 2, nothing listed", 7, 2);
+    assert!(r.of("access").is_empty(), "{:?}", r.lines);
+    let r = c.cmd(&format!("access {sr}/listonly/a.txt"));
+    assert_eq!(r.kind().as_deref(), Some("access_denied"), "{:?}", r.lines);
+    r.expect(
+        "access listonly/a.txt: the second CREATE of the chain refused",
+        4,
+        1,
+    );
+    let r = c.cmd(&format!("access -e {sr}/mixed"));
+    r.expect_ok("access -e mixed");
+    r.expect(
+        "access -e mixed: 5 + 10 + 4 (c.txt and d asked again alone)",
+        19,
+        3,
+    );
+    for i in 0..2 {
+        let r = c.cmd("access -e /tree");
+        r.expect_ok("access -e /tree");
+        r.expect(&format!("access -e /tree ({i}): 5 + 14, no cache"), 19, 2);
+        assert_eq!(r.of("access").len(), 6);
+    }
+    let r = c.cmd("access -e /");
+    r.expect_ok("access -e /");
+    let st = r.stats();
+    assert!(
+        st.requests == 43 && (2..=3).contains(&st.flights),
+        "access -e /: 5 + 2 x 19 in 2 or 3 flights\n{}",
+        context(st)
+    );
+    let r = c.cmd("access -e /tree/d0/file.txt");
+    assert_eq!(r.kind().as_deref(), Some("not_a_directory"));
+    r.expect("access -e of a file: the listing only", 5, 1);
+    let r = c.cmd("ls /tree");
+    r.expect_ok("ls /tree");
+    r.expect("ls /tree as before this stage", 5, 1);
+    let r = c.cmd("cd /tree/d0");
+    r.expect_ok("cd /tree/d0");
+    r.expect("cd /tree/d0 as before this stage", 2, 1);
+    let (code, _) = c.finish();
+    assert_eq!(code, 1, "the failed commands");
+}
+
+/// F85: the text lines byte for byte, the JSON objects' keys, the working directory, usage.
+#[test]
+fn access_output() {
+    let s = Scratch::new(fast());
+    posix_fixture(&s);
+    let sr = s.remote();
+    let o = run_fast(
+        &[
+            "-C",
+            "use share",
+            "-C",
+            &format!("access {sr}/mine.txt"),
+            "-C",
+            &format!("access {sr}/rodir"),
+            "-C",
+            &format!("access -e {sr}/mixed"),
+            "-C",
+            "cd /tree",
+            "-C",
+            "access",
+        ],
+        None,
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stdout,
+        format!(
+            "-  get put       rm     {sr}/mine.txt\n\
+             d  ls  -   -     rmdir  {sr}/rodir/\n\
+             -  get put       rm     a.txt\n\
+             -  ?   ?         ?      b.fifo  (other)\n\
+             -  get put       rm     c.txt\n\
+             d  ls  put mkdir rmdir  d/\n\
+             d  ls  -   -     -      /tree/\n"
+        )
+    );
+    let mut c = Client::to(fast(), &[]);
+    let r = c.cmd("access");
+    assert_eq!(
+        r.kind().as_deref(),
+        Some("usage"),
+        "before use: {:?}",
+        r.lines
+    );
+    c.cmd("use share").expect_ok("use share");
+    let r = c.cmd(&format!("access -e {sr}"));
+    r.expect_ok("access -e S");
+    let names: Vec<&str> = r
+        .of("access")
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "in the listing's order");
+    let by = access_by_name(&r);
+    let keys = |v: &Value| -> BTreeSet<String> { v.as_object().unwrap().keys().cloned().collect() };
+    let common = [
+        "type",
+        "name",
+        "path",
+        "is_dir",
+        "mask",
+        "attributes",
+        "error",
+    ];
+    let want = |extra: &[&str]| -> BTreeSet<String> {
+        common.iter().chain(extra).map(|k| k.to_string()).collect()
+    };
+    let dir = &by["rodir"];
+    assert_eq!(keys(dir), want(&["ls", "put", "mkdir", "rmdir"]), "{dir}");
+    assert_eq!(dir["is_dir"], true);
+    let file = &by["mine.txt"];
+    assert_eq!(keys(file), want(&["get", "replace", "rm"]), "{file}");
+    for v in [dir, file] {
+        assert!(v["mask"].is_u64() && v["attributes"].is_u64(), "{v}");
+        assert_eq!(v["error"], Value::Null, "{v}");
+    }
+    assert_eq!(file["path"], format!("{sr}/mine.txt"));
+    assert_eq!(dir["mask"], 0x0013_00a9, "{dir}");
+    assert_eq!(file["mask"], 0x0017_019f, "{file}");
+    let r = c.cmd("access -e a b");
+    assert_eq!(r.kind().as_deref(), Some("usage"), "{:?}", r.lines);
+    let r = c.cmd("access -- -e");
+    assert_eq!(r.kind().as_deref(), Some("not_found"), "{:?}", r.lines);
+    let m = r.of("error")[0]["message"].as_str().unwrap().to_string();
+    assert!(m.contains("/-e"), "{m}");
+}
+
+/// F86: `access -e` lists like `ls`, so Tab below it costs nothing.
+#[test]
+fn access_refreshes_the_cache() {
+    let dir = tmp("access_refreshes_the_cache");
+    let (mut p, tap, _) = Pty::tapped(fast(), &[], &dir.join("history"));
+    p.line("use share", &p1());
+    p.line("access -e /tree", &p1());
+    take(&tap);
+    expect_stats(
+        &tab(&mut p, &tap, "cd /tree/d", None),
+        "Tab after access -e",
+        0,
+        0,
+    );
+    p.send(b"\t");
+    let shown = p.expect("d3/", WAIT);
+    for d in ["d0/", "d1/", "d2/"] {
+        assert!(shown.contains(d), "{shown}");
+    }
+    expect_stats(&take(&tap), "the second Tab", 0, 0);
+    p.send(CTRL_U);
+    p.send(b"exit\r");
+    assert_eq!(p.exit_code(WAIT), 0);
+}
+
+/// How a row of a prediction test must come out (docs/plans/stage-6.md 7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expect {
+    /// The column says what the command did: true and it succeeded, false and it failed.
+    Agree,
+    /// A known disagreement of the plan's 2.7 (K1, K2, K3, K4, K7): the column says the opposite.
+    K(u8),
+    /// The column is null (`?`); the command did what the plan measured.
+    Unknown,
+}
+
+/// (path below the scratch directory, JSON key, the command line run in the scratch directory,
+/// expectation, the outcome measured while planning: None succeeded, else the error kind).
+type Row = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Expect,
+    Option<&'static str>,
+);
+
+/// The `access` objects of `lines` (run in a session standing in the scratch directory `sr`), by
+/// path below `sr` ("" for `sr` itself). Every `access` line must succeed.
+fn access_objects(c: &mut Client, sr: &str, lines: &[String]) -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
+    for l in lines {
+        let r = c.cmd(l);
+        r.expect_ok(l);
+        for v in r.of("access") {
+            let p = v["path"].as_str().unwrap();
+            let rel = p.strip_prefix(sr).unwrap().trim_start_matches('/');
+            m.insert(rel.to_string(), v.clone());
+        }
+    }
+    m
+}
+
+/// Every mask equals the measured one (a Samba upgrade that changes an answer fails here).
+fn check_masks(what: &str, objs: &BTreeMap<String, Value>, masks: &[(&str, u64)]) {
+    let mut bad = Vec::new();
+    for (path, mask) in masks {
+        match objs.get(*path) {
+            None => bad.push(format!("{path}: no access object")),
+            Some(v) if v["mask"] != *mask => bad.push(format!(
+                "{path}: mask {} (measured {mask:#010x}): {v}",
+                v["mask"]
+            )),
+            _ => {}
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{what}: masks differ from docs/plans/stage-6.md 2.4, 2.6, 2.13:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// Runs the rows' lines in order and compares each prediction with what the command did.
+fn check_rows(what: &str, c: &mut Client, objs: &BTreeMap<String, Value>, rows: &[Row]) {
+    let lines: Vec<String> = rows.iter().map(|r| r.2.to_string()).collect();
+    let got = outcomes(c, &lines);
+    let mut bad = Vec::new();
+    for ((path, key, line, expect, real), out) in rows.iter().zip(&got) {
+        let pred = objs
+            .get(*path)
+            .unwrap_or_else(|| panic!("{what}: no access object for {path}"))[*key]
+            .as_bool();
+        let fits = match expect {
+            Expect::Agree => pred == Some(real.is_none()),
+            Expect::K(_) => pred == Some(real.is_some()),
+            Expect::Unknown => pred.is_none(),
+        };
+        if !fits || out.as_deref() != *real {
+            bad.push(format!(
+                "{line}: {path} {key} = {pred:?}, the command {out:?}; the plan (2.7, 2.13) says \
+                 {expect:?} with {real:?}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{what}:\n{}", bad.join("\n"));
+}
+
+const POSIX_MASKS: &[(&str, u64)] = &[
+    ("", 0x001f_01ff),
+    ("mine.txt", 0x0017_019f),
+    ("rm-mine.txt", 0x0017_019f),
+    ("rootfile.txt", 0x0013_0089),
+    ("rm-rootfile.txt", 0x0013_0089),
+    ("secret.txt", 0x0001_0080),
+    ("rm-secret.txt", 0x0001_0080),
+    ("big.bin", 0x0001_0080),
+    ("dosro.txt", 0x0004_0089),
+    ("rm-dosro.txt", 0x0004_0089),
+    ("rodir", 0x0013_00a9),
+    ("rodir/f.txt", 0x0012_0089),
+    ("rodir/rm-f.txt", 0x0012_0089),
+    ("rodir/ww.txt", 0x0012_019f),
+    ("rodir/sub", 0x0012_00a9),
+    ("rodir2", 0x0013_00a9),
+    ("rodir2/minefile.txt", 0x0016_019f),
+    ("rodir2/rm-minefile.txt", 0x0016_019f),
+    ("rodir2/minedir", 0x001f_01ff),
+    ("sticky", 0x001f_01ff),
+    ("sticky/rootfile.txt", 0x0012_0089),
+    ("sticky/rm-rootfile.txt", 0x0012_0089),
+    ("sticky/mine.txt", 0x0017_019f),
+    ("sticky/rm-mine.txt", 0x0017_019f),
+    ("sticky/rootsub", 0x0012_00a9),
+    ("sticky/minesub", 0x001f_01ff),
+    ("sticky/rwxsub", 0x001f_01ff),
+    ("emptyroot", 0x0013_00a9),
+    ("emptymine", 0x001f_01ff),
+    ("listonly", 0x0013_0089),
+    ("writeonly", 0x0013_01f6),
+    ("rodos", 0x000c_00e9),
+    ("rodos/f.txt", 0x0017_019f),
+    ("rodos/sub", 0x001f_01ff),
+    ("mixed", 0x001f_01ff),
+    ("mixed/a.txt", 0x0017_019f),
+    ("mixed/c.txt", 0x0017_019f),
+    ("mixed/d", 0x001f_01ff),
+];
+
+const POSIX_ROWS: &[Row] = &[
+    ("", "ls", "ls .", Expect::Agree, None),
+    ("", "put", "put notes.txt ./", Expect::Agree, None),
+    ("", "mkdir", "mkdir new", Expect::Agree, None),
+    ("mine.txt", "get", "get mine.txt dl/", Expect::Agree, None),
+    (
+        "mine.txt",
+        "replace",
+        "put -f notes.txt mine.txt",
+        Expect::Agree,
+        None,
+    ),
+    ("rm-mine.txt", "rm", "rm rm-mine.txt", Expect::Agree, None),
+    (
+        "rootfile.txt",
+        "get",
+        "get rootfile.txt dl/",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "rootfile.txt",
+        "replace",
+        "put -f notes.txt rootfile.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "rm-rootfile.txt",
+        "rm",
+        "rm rm-rootfile.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "secret.txt",
+        "get",
+        "get secret.txt dl/",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "secret.txt",
+        "replace",
+        "put -f notes.txt secret.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "rm-secret.txt",
+        "rm",
+        "rm rm-secret.txt",
+        Expect::Agree,
+        None,
+    ),
+    // K6, fixed by A14: the check of a large put opens for the attributes only
+    (
+        "big.bin",
+        "replace",
+        "put -f big.bin big.bin",
+        Expect::Agree,
+        None,
+    ),
+    ("dosro.txt", "get", "get dosro.txt dl/", Expect::Agree, None),
+    (
+        "dosro.txt",
+        "replace",
+        "put -f notes.txt dosro.txt",
+        Expect::K(1),
+        None,
+    ),
+    (
+        "rm-dosro.txt",
+        "rm",
+        "rm rm-dosro.txt",
+        Expect::Agree,
+        Some("other"),
+    ),
+    ("rodir", "ls", "ls rodir", Expect::Agree, None),
+    (
+        "rodir",
+        "put",
+        "put notes.txt rodir/",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir",
+        "mkdir",
+        "mkdir rodir/new",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir/f.txt",
+        "get",
+        "get rodir/f.txt dl/",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "rodir/f.txt",
+        "replace",
+        "put -f notes.txt rodir/f.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir/rm-f.txt",
+        "rm",
+        "rm rodir/rm-f.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir/ww.txt",
+        "replace",
+        "put -f notes.txt rodir/ww.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir/sub",
+        "rmdir",
+        "rmdir rodir/sub",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir2/minefile.txt",
+        "replace",
+        "put -f notes.txt rodir2/minefile.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir2/rm-minefile.txt",
+        "rm",
+        "rm rodir2/rm-minefile.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "rodir2/minedir",
+        "rmdir",
+        "rmdir rodir2/minedir",
+        Expect::Unknown,
+        Some("access_denied"),
+    ),
+    ("sticky", "ls", "ls sticky", Expect::Agree, None),
+    (
+        "sticky",
+        "put",
+        "put notes.txt sticky/",
+        Expect::Agree,
+        None,
+    ),
+    ("sticky", "mkdir", "mkdir sticky/new", Expect::Agree, None),
+    (
+        "sticky/rootfile.txt",
+        "replace",
+        "put -f notes.txt sticky/rootfile.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "sticky/rm-rootfile.txt",
+        "rm",
+        "rm sticky/rm-rootfile.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "sticky/mine.txt",
+        "replace",
+        "put -f notes.txt sticky/mine.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "sticky/rm-mine.txt",
+        "rm",
+        "rm sticky/rm-mine.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "sticky/rootsub",
+        "rmdir",
+        "rmdir sticky/rootsub",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "sticky/minesub",
+        "rmdir",
+        "rmdir sticky/minesub",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "sticky/rwxsub",
+        "rmdir",
+        "rmdir sticky/rwxsub",
+        Expect::K(3),
+        Some("access_denied"),
+    ),
+    ("emptyroot", "ls", "ls emptyroot", Expect::Agree, None),
+    (
+        "emptyroot",
+        "put",
+        "put notes.txt emptyroot/",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "emptyroot",
+        "mkdir",
+        "mkdir emptyroot/new",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    ("emptyroot", "rmdir", "rmdir emptyroot", Expect::Agree, None),
+    ("emptymine", "rmdir", "rmdir emptymine", Expect::Agree, None),
+    ("listonly", "ls", "ls listonly", Expect::Agree, None),
+    (
+        "writeonly",
+        "ls",
+        "ls writeonly",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "writeonly",
+        "put",
+        "put notes.txt writeonly/",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "writeonly",
+        "mkdir",
+        "mkdir writeonly/new",
+        Expect::Agree,
+        None,
+    ),
+    // 2.13: a directory's DOS read-only attribute hides the rights and is not enforced
+    (
+        "rodos",
+        "put",
+        "put notes.txt rodos/",
+        Expect::Unknown,
+        None,
+    ),
+    ("rodos", "mkdir", "mkdir rodos/new", Expect::Unknown, None),
+    (
+        "rodos/f.txt",
+        "replace",
+        "put -f notes.txt rodos/f.txt",
+        Expect::Unknown,
+        None,
+    ),
+    ("rodos/sub", "rmdir", "rmdir rodos/sub", Expect::Agree, None),
+    (
+        "rodos2",
+        "rmdir",
+        "rmdir rodos2",
+        Expect::Agree,
+        Some("other"),
+    ),
+    (
+        "mixed/c.txt",
+        "get",
+        "get mixed/c.txt dl/",
+        Expect::Agree,
+        None,
+    ),
+];
+
+/// F81: the prediction against the real command on POSIX permissions (`share` of `fast()`), row
+/// by row of docs/plans/stage-6.md 2.7 and 2.13, the known disagreements pinned.
+#[test]
+fn access_predicts_posix() {
+    let dir = tmp("access_predicts_posix");
+    stage6_local(&dir);
+    std::fs::create_dir(dir.join("dl")).unwrap();
+    let s = Scratch::new(fast());
+    posix_fixture(&s);
+    let sr = s.remote();
+    let mut c = direct_in(&dir, Some(&sr));
+    let mut lines = vec![format!("access {sr}"), format!("access -e {sr}")];
+    for d in ["rodir", "rodir2", "sticky", "listonly", "rodos", "mixed"] {
+        lines.push(format!("access -e {sr}/{d}"));
+    }
+    let objs = access_objects(&mut c, &sr, &lines);
+    check_masks("POSIX", &objs, POSIX_MASKS);
+    assert_eq!(objs["rodos"]["attributes"].as_u64().unwrap() & 0x11, 0x11);
+    // the FIFO cuts the chain of -e mixed; c.txt and d were asked again and landed in their places
+    let fifo = &objs["mixed/b.fifo"];
+    assert_eq!(
+        (&fifo["mask"], &fifo["error"]),
+        (&Value::Null, &Value::from("other")),
+        "{fifo}"
+    );
+    for n in ["mixed/a.txt", "mixed/c.txt", "mixed/d"] {
+        assert_eq!(
+            objs[n]["name"],
+            n.rsplit('/').next().unwrap(),
+            "{}",
+            objs[n]
+        );
+        assert_eq!(objs[n]["error"], Value::Null, "{}", objs[n]);
+    }
+    // Samba lists nothing in listonly (0744: readable, not traversable), so -e shows no entry;
+    // asked alone, an entry is the command's error (deviation 1 of the Stage 6 plan).
+    assert!(!objs.contains_key("listonly/a.txt"));
+    let r = c.cmd(&format!("access {sr}/listonly/a.txt"));
+    assert_eq!(r.kind().as_deref(), Some("access_denied"), "{:?}", r.lines);
+    check_rows("POSIX", &mut c, &objs, POSIX_ROWS);
+    let r = c.cmd("get listonly/a.txt dl/");
+    assert_eq!(r.kind().as_deref(), Some("access_denied"), "{:?}", r.lines);
+}
+
+const NT_MASKS: &[(&str, u64)] = &[
+    ("A", 0x0012_00ab),
+    ("C", 0x0012_00ad),
+    ("D", 0x0012_00e9),
+    ("D/file.txt", 0x0013_0089),
+    ("D/rm-file.txt", 0x0013_0089),
+    ("D/denydel.txt", 0x0013_0089),
+    ("E", 0x0012_00af),
+    ("E/file.txt", 0x0013_0089),
+    ("E/rm-file.txt", 0x0013_0089),
+    ("E/empty", 0x0012_00a9),
+    ("F", 0x0012_00ab),
+    ("F/file.txt", 0x0012_0089),
+    ("F/rm-file.txt", 0x0012_0089),
+    ("G", 0x0012_00ab),
+    ("H", 0x0012_00a9),
+    ("H/nosync.txt", 0x0000_0081),
+    ("H/nosyncdir", 0x0000_0081),
+    ("I", 0x0012_00a9),
+    ("I/sub", 0x001f_01ff),
+    ("I/own.txt", 0x001f_01ff),
+    ("I/rm-own.txt", 0x001f_01ff),
+    ("J", 0x0012_00ab),
+];
+
+const NT_ROWS: &[Row] = &[
+    ("A", "put", "put notes.txt A/", Expect::Agree, None),
+    (
+        "A",
+        "mkdir",
+        "mkdir A/new",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "C",
+        "put",
+        "put notes.txt C/",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    ("C", "mkdir", "mkdir C/new", Expect::Agree, None),
+    (
+        "D/file.txt",
+        "get",
+        "get D/file.txt dl/",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "D/rm-file.txt",
+        "rm",
+        "rm D/rm-file.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "D/denydel.txt",
+        "rm",
+        "rm D/denydel.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "D/file.txt",
+        "replace",
+        "put -f notes.txt D/file.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "E/file.txt",
+        "replace",
+        "put -f notes.txt E/file.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "E/rm-file.txt",
+        "rm",
+        "rm E/rm-file.txt",
+        Expect::Agree,
+        None,
+    ),
+    (
+        "E/empty",
+        "rmdir",
+        "rmdir E/empty",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "F/file.txt",
+        "replace",
+        "put -f notes.txt F/file.txt",
+        Expect::K(2),
+        None,
+    ),
+    (
+        "F/rm-file.txt",
+        "rm",
+        "rm F/rm-file.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    ("G", "put", "put notes.txt G/", Expect::Agree, None),
+    (
+        "G",
+        "mkdir",
+        "mkdir G/new",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "J",
+        "put",
+        "put notes.txt J/",
+        Expect::K(7),
+        Some("access_denied"),
+    ),
+    (
+        "J",
+        "mkdir",
+        "mkdir J/new",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+    (
+        "H/nosync.txt",
+        "get",
+        "get H/nosync.txt dl/",
+        Expect::K(4),
+        Some("access_denied"),
+    ),
+    (
+        "H/nosyncdir",
+        "ls",
+        "ls H/nosyncdir",
+        Expect::K(4),
+        Some("access_denied"),
+    ),
+    ("I/sub", "rmdir", "rmdir I/sub", Expect::Unknown, None),
+    ("I/rm-own.txt", "rm", "rm I/rm-own.txt", Expect::Agree, None),
+    (
+        "I/own.txt",
+        "replace",
+        "put -f notes.txt I/own.txt",
+        Expect::Agree,
+        Some("access_denied"),
+    ),
+];
+
+/// F82: the same on NT ACLs (the DC, Kerberos), the drop box of K7 included.
+#[test]
+fn access_predicts_nt_acls() {
+    let ep = dc();
+    let dir = tmp("access_predicts_nt_acls");
+    stage6_local(&dir);
+    std::fs::create_dir(dir.join("dl")).unwrap();
+    let cache = krb_cache(&dir, "k.cc", "-f", "tester", &[ep.spn(true)]);
+    let s = Scratch::new(ep);
+    nt_fixture(&s);
+    let sr = s.remote();
+    let c = Client::kerberos(ep, &cache, &[], &[]);
+    let mut c = ready(c, &dir, Some(&sr));
+    // No stale DOS attribute on the scratch directory (finding 1 of the plan's review).
+    let objs = access_objects(&mut c, &sr, &[format!("access {sr}")]);
+    let me = &objs[""];
+    assert_eq!(
+        (me["mask"].as_u64(), me["attributes"].as_u64()),
+        (Some(0x001f_01ff), Some(0x10)),
+        "the scratch directory on the DC: {me}"
+    );
+    let mut lines = vec![format!("access -e {sr}")];
+    for d in ["D", "E", "F", "H", "I"] {
+        lines.push(format!("access -e {sr}/{d}"));
+    }
+    let objs = access_objects(&mut c, &sr, &lines);
+    check_masks("NT ACLs", &objs, NT_MASKS);
+    check_rows("NT ACLs", &mut c, &objs, NT_ROWS);
+    // K7: the drop box took the temporary file and refused its rename; it is left behind
+    let left = temps_on_server(SAMBA_DC, &format!("{}/J", s.server()));
+    assert_eq!(left.len(), 1, "the part file of put notes.txt J/: {left:?}");
+}
+
+/// F83: the share's `read only`, encryption and the guest logins are in the server's answer.
+#[test]
+fn access_by_share_and_login() {
+    let dir = tmp("access_by_share_and_login");
+    stage6_local(&dir);
+    let s = Scratch::new(fast());
+    posix_fixture(&s);
+    let sr = s.remote();
+    let by_path = |r: &Reply| -> BTreeMap<String, Value> {
+        r.of("access")
+            .into_iter()
+            .map(|v| (v["path"].as_str().unwrap().to_string(), v.clone()))
+            .collect()
+    };
+    let every = |c: &mut Client, share: &str| {
+        c.cmd(&format!("use {share}")).expect_ok(share);
+        let r = c.cmd(&format!("access -e {sr}"));
+        r.expect_ok(&format!("access -e on {share}"));
+        by_path(&r)
+    };
+    let mut c = Client::to(fast(), &[]);
+    let share = every(&mut c, "share");
+    // readonly: every change refused, reading as on share
+    let mut c = ready(Client::to(fast(), &[]), &dir, None);
+    let ro = every(&mut c, "readonly");
+    assert_eq!(ro.len(), share.len());
+    for (p, v) in &ro {
+        let on_share = &share[p];
+        let rodos = p.ends_with("/rodos") || p.ends_with("/rodos2");
+        if v["is_dir"] == true {
+            assert_eq!(v["ls"], on_share["ls"], "{p} ls");
+            // a directory with the DOS read-only attribute: put and mkdir are unknown (A7)
+            let refused = if rodos {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+            for k in ["put", "mkdir"] {
+                assert_eq!(v[k], refused, "{p} {k} on readonly: {v}");
+            }
+            assert_eq!(v["rmdir"], false, "{p} rmdir on readonly: {v}");
+        } else {
+            assert_eq!(v["get"], on_share["get"], "{p} get");
+            for k in ["replace", "rm"] {
+                assert_eq!(v[k], false, "{p} {k} on readonly: {v}");
+            }
+        }
+    }
+    assert_eq!(ro[&format!("{sr}/secret.txt")]["get"], false);
+    assert_eq!(ro[&format!("{sr}/mine.txt")]["mask"], 0x0004_0089);
+    assert_eq!(ro[&format!("{sr}/rootfile.txt")]["mask"], 0x0000_0089);
+    let r = c.cmd(&format!("access {sr}"));
+    assert_eq!(r.of("access")[0]["mask"], 0x000c_00a9, "{:?}", r.lines);
+    for line in [
+        format!("put notes.txt {sr}/"),
+        format!("rm {sr}/rm-mine.txt"),
+        format!("mkdir {sr}/x"),
+    ] {
+        let r = c.cmd(&line);
+        assert_eq!(
+            r.kind().as_deref(),
+            Some("access_denied"),
+            "{line}: {:?}",
+            r.lines
+        );
+    }
+    // encrypted: the same masks as on share
+    let mut c = Client::to(fast(), &[]);
+    let enc = every(&mut c, "encrypted");
+    let masks = |m: &BTreeMap<String, Value>| -> BTreeMap<String, Value> {
+        m.iter()
+            .map(|(p, v)| (p.clone(), v["mask"].clone()))
+            .collect()
+    };
+    assert_eq!(masks(&enc), masks(&share), "encrypted against share");
+    // guest, anonymous and as Guest; and tester on share, in text
+    let route = fast().route(None);
+    let text = |login: &[&str], share: &str, line: &str| -> Output {
+        let mut a: Vec<&str> = route.iter().map(String::as_str).collect();
+        a.extend(login);
+        let use_share = format!("use {share}");
+        a.extend(["-C", &use_share, "-C", line]);
+        run(&a, None)
+    };
+    let root = "d  ls  -   -     -      /\n";
+    for login in [&[][..], &["-u", "Guest", "--no-pass"][..]] {
+        let o = text(login, "guest", "access /");
+        assert_eq!(
+            (o.code, o.stdout.as_str()),
+            (0, root),
+            "{login:?}: {}",
+            o.stderr
+        );
+        let o = text(login, "guest", "access hello.txt");
+        assert_eq!(
+            (o.code, o.stdout.as_str()),
+            (0, "-  get -         -      /hello.txt\n"),
+            "{login:?}: {}",
+            o.stderr
+        );
+        let o = run_in(
+            &dir,
+            &[
+                &route.iter().map(String::as_str).collect::<Vec<_>>()[..],
+                login,
+                &["-C", "use guest", "-C", "put notes.txt /"],
+            ]
+            .concat(),
+            None,
+            &[],
+        );
+        assert_eq!(
+            o.code, 1,
+            "{login:?}: put into the guest share: {}",
+            o.stderr
+        );
+    }
+    let o = text(&LOGIN, "share", "access /");
+    assert_eq!((o.code, o.stdout.as_str()), (0, root), "{}", o.stderr);
 }

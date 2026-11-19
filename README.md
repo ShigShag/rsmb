@@ -6,11 +6,13 @@ single compound open/close for `cd`, a directory listing in one compound, cached
 listings for Tab completion, nothing sent between commands, transfers and walks that keep up to
 16 requests in flight.
 
-**Status: all five stages are done.** Login (user/password/domain, guest, anonymous, and
+**Status: all six stages are done.** Login (user/password/domain, guest, anonymous, and
 Kerberos from the ticket cache with `-k`, direct and through the proxy, the KDC included), an
 interactive shell with history and completion (remote and local paths), a non-interactive mode
 with `--json` and fixed exit codes, the commands `shares` (with the share-level access the
-server reports for each share, one more round trip), `use`, `cd`, `pwd`, `ls`, `tree`
+server reports for each share, one more round trip), `use`, `cd`, `pwd`, `ls`, `access`
+(`-e`: which commands the server would allow on a path or on every entry of a directory, asked
+with one open per path and nothing tried; `cd` and `ls` unchanged), `tree`
 (`-L`), `find` (`-name`, `-iname`, `-type`, `-size`, `-maxdepth`), `get` and `put` (single files
 and `-r` directories, streaming, never a partial file under the final name, no overwrite without
 `-f`), `cat`, `mkdir` (`-p`), `rm`, `rmdir`, `lcd`, `lpwd`, `lls`, `refresh`, `help` (`help
@@ -70,6 +72,9 @@ target/release/rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM -C 'use sha
 
 # directory tree, two levels deep
 target/release/rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM -C 'use share' -C 'tree -L 2 /tree'
+
+# may I list, put into, make a directory in, remove upload? and the same for every entry of /tree
+target/release/rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM -C 'use share' -C 'access upload' -C 'access -e /tree'
 
 # find files by name pattern (quote it so the local shell does not expand it)
 target/release/rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM -C 'use share' -C "find /special -name '*.txt'"
@@ -154,8 +159,8 @@ server the host cannot reach, and a Samba AD domain controller with its own KDC 
 ```
 ./testenv/up.sh      # build and start: about 150 s from nothing (6 GB image and the DC's 219 MB), seconds with the images built
 ./testenv/check.sh   # verify the environment with independent tools (about 30 s)
-./test.sh            # everything: 477 s counted of the 600 s budget (about 8 min)
-./test.sh fast       # up to tests/fast, direct and through the proxy: about 62 s of 150
+./test.sh            # everything: about 506 s counted of the 600 s budget (about 9 min)
+./test.sh fast       # up to tests/fast, direct and through the proxy: about 77 s of 150
 ./testenv/down.sh    # stop and remove containers and networks
 ```
 

@@ -104,6 +104,13 @@ stderr.
   comment's first paragraph is what `--help` shows: one short line, so that the line stays within
   80 columns (`args_are_sound` checks it); details go into a second paragraph, which only the
   manual shows, joined to the first by "; ".
+- A **fixture a test needs only for itself** is made at run time in its `Scratch`, not in the
+  images: `posix_fixture` (owners, modes, a sticky directory, a FIFO, the DOS read-only attribute,
+  as root on the test's container) and `nt_fixture` (NT ACLs with `smbcacls` inside the DC) are the
+  examples (`docs/plans/stage-6.md` section 6). On the DC, `Scratch` checks its directory at
+  creation and removes it through Samba (`docs/test-environment.md`); an object a test makes
+  there outside Samba (in the container) must be checked over SMB as `nt_fixture` does, because it
+  may sit on an inode with a stale record; a test there never replaces a file it made read-only.
 - A new **JSON object type** goes into `JSON_OBJECTS` in `src/commands.rs`;
   `every_json_line_has_a_type` fails for a type that is printed but not listed.
 

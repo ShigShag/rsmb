@@ -1281,10 +1281,46 @@ impl Scratch {
         } else {
             "chown tester:tester"
         };
-        docker_sh(
-            s.container,
-            &format!("mkdir -p '{0}' && {own} '{0}'", s.server()),
-        );
+        let make = format!("mkdir -p '{0}' && {own} '{0}'", s.server());
+        docker_sh(s.container, &make);
+        // On the DC the directory made outside Samba may sit on an inode whose records in
+        // xattr.tdb outlived an object that Samba replaced by a rename (F82 replaces two files each
+        // run): a read-only flag, a file's attributes or an NT ACL. The flags are cleared here;
+        // when it then does not list as a plain directory with the ACL Samba derives from its
+        // mode, it is removed through Samba, which drops the records, and made again
+        // (docs/plans/stage-6.md 2.13 and W11).
+        if s.container == SAMBA_DC {
+            for attempt in 1.. {
+                let o = dc_smbclient(&format!(
+                    "cd upload; setmode \"{0}\" -rsh; allinfo \"{0}\"",
+                    s.name
+                ));
+                let info = String::from_utf8_lossy(&o.stdout);
+                let acl = Command::new("docker")
+                    .args(["exec", SAMBA_DC, "smbcacls", "//127.0.0.1/share"])
+                    .arg(&s.remote()[1..])
+                    .args(["-U", DC_ADMIN])
+                    .output()
+                    .unwrap();
+                let acl = String::from_utf8_lossy(&acl.stdout);
+                if info.lines().any(|l| l == "attributes: D (10)") && acl == DC_SCRATCH_ACL {
+                    break;
+                }
+                assert!(
+                    attempt < 3,
+                    "Scratch on the DC: upload/{} still carries stale records after {attempt} \
+                     attempts\n{info}\n{acl}",
+                    s.name
+                );
+                eprintln!(
+                    "Scratch: upload/{} came up with stale records on the DC; made again",
+                    s.name
+                );
+                // Empty yet, and `rmdir` goes by what the directory is, not by its attributes.
+                dc_smbclient(&format!("cd upload; rmdir \"{}\"", s.name));
+                docker_sh(s.container, &format!("rm -rf '{}' && {make}", s.server()));
+            }
+        }
         s
     }
     /// The path in the share: `/upload/rsmb-test-…`.
@@ -1310,9 +1346,92 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        // On the DC the tree is removed through Samba first, which drops its records in xattr.tdb;
+        // `rm -rf` alone would leave them for the next object on the same inode
+        // (docs/plans/stage-6.md W11).
+        if self.container == SAMBA_DC {
+            dc_remove(&self.name, &self.server());
+        }
         let _ = Command::new("docker")
             .args(["exec", self.container, "rm", "-rf", &self.server()])
             .output();
+    }
+}
+
+/// The DC's administrator, for `smbclient` and `smbcacls` inside the DC (the throwaway password of
+/// the DC's image, docs/test-environment.md).
+const DC_ADMIN: &str = "RSMB\\Administrator%Adm1n-testpass";
+
+/// What `smbcacls` shows for a scratch directory on the DC with no NT ACL of its own: the one
+/// Samba derives from root's mode 1777 (S-1-22-2-0 is the Unix group root).
+const DC_SCRATCH_ACL: &str = "REVISION:1
+CONTROL:SR|DP
+OWNER:RSMB\\Administrator
+GROUP:S-1-22-2-0
+ACL:RSMB\\Administrator:ALLOWED/0x0/FULL
+ACL:S-1-22-2-0:ALLOWED/0x0/FULL
+ACL:Everyone:ALLOWED/0x0/FULL
+ACL:CREATOR OWNER:ALLOWED/OI|CI|IO/FULL
+ACL:CREATOR GROUP:ALLOWED/OI|CI|IO/READ
+ACL:Everyone:ALLOWED/OI|CI|IO/READ
+";
+
+/// `smbclient -c <cmd>` on the DC's `share` as the DC's administrator, inside the DC. The
+/// administrator is root to Samba, so no ACL of a fixture stands in its way.
+fn dc_smbclient(cmd: &str) -> std::process::Output {
+    Command::new("docker")
+        .args([
+            "exec",
+            SAMBA_DC,
+            "smbclient",
+            "//127.0.0.1/share",
+            "-U",
+            DC_ADMIN,
+            "-c",
+        ])
+        .arg(cmd)
+        .output()
+        .unwrap()
+}
+
+/// Removes `upload/<name>` on the DC through Samba: `setmode "<path>" -rsh` for the directory and
+/// everything inside (`deltree` refuses a read-only object with `NT_STATUS_CANNOT_DELETE`), then
+/// `deltree <name>` from
+/// the parent, all in one `smbclient` call. The DC keeps DOS attributes and NT ACLs in xattr.tdb
+/// by inode; a removal through Samba drops the records, a removal outside Samba leaves them, and
+/// the next object made outside Samba on that inode would inherit them, a file even the directory
+/// bit (docs/test-environment.md). A failure is printed, not raised: `nt_fixture` catches what it
+/// leaves behind.
+fn dc_remove(name: &str, server: &str) {
+    let Ok(o) = Command::new("docker")
+        .args([
+            "exec",
+            "-w",
+            server,
+            SAMBA_DC,
+            "find",
+            ".",
+            "-mindepth",
+            "1",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !o.status.success() {
+        return;
+    }
+    let mut cmd = format!("cd upload; setmode \"{name}\" -rsh; cd \"{name}\"");
+    for l in String::from_utf8_lossy(&o.stdout).lines() {
+        cmd += &format!("; setmode \"{}\" -rsh", l.trim_start_matches("./"));
+    }
+    cmd += &format!("; cd ..; deltree \"{name}\"");
+    let o = dc_smbclient(&cmd);
+    if !o.status.success() {
+        eprintln!(
+            "Scratch: removing upload/{name} through Samba on the DC failed: {}",
+            String::from_utf8_lossy(&o.stdout)
+        );
     }
 }
 
@@ -1734,6 +1853,158 @@ pub fn piped(ep: Ep, line: &str, filter: &str) -> Piped {
         took: o.took,
         stats,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 6: what may I do here (docs/plans/stage-6.md 6, 7.1)
+
+/// The POSIX fixture of the Stage 6 plan, 6.1, made as root in `s` on its container (a Samba
+/// server without NT ACLs: `samba` direct, `samba-private` through the proxy). The DOS read-only
+/// attribute is set over SMB from inside the container; these servers keep it on the file
+/// itself, so removing the scratch directory removes it.
+pub fn posix_fixture(s: &Scratch) {
+    const SCRIPT: &str = r#"set -e
+f() { echo "$1" > "$1"; chown "$2" "$1"; chmod "$3" "$1"; }
+for p in '' rm-; do
+  f ${p}mine.txt tester:tester 0644
+  f ${p}rootfile.txt root:root 0644
+  f ${p}secret.txt root:root 0600
+  f ${p}dosro.txt tester:tester 0644
+done
+head -c 300000 /dev/zero > big.bin; chown root:root big.bin; chmod 0600 big.bin
+mkdir rodir rodir/sub; f rodir/f.txt root:root 0644; f rodir/rm-f.txt root:root 0644
+f rodir/ww.txt root:root 0666; chown root:root rodir rodir/sub; chmod 0755 rodir rodir/sub
+mkdir rodir2 rodir2/minedir; f rodir2/minefile.txt tester:tester 0644
+f rodir2/rm-minefile.txt tester:tester 0644
+chown tester:tester rodir2/minedir; chown root:root rodir2; chmod 0755 rodir2
+mkdir sticky sticky/rootsub sticky/minesub sticky/rwxsub
+f sticky/rootfile.txt root:root 0644; f sticky/rm-rootfile.txt root:root 0644
+f sticky/mine.txt tester:tester 0644; f sticky/rm-mine.txt tester:tester 0644
+chown tester:tester sticky/minesub; chmod 0777 sticky/rwxsub
+chown root:root sticky sticky/rootsub sticky/rwxsub; chmod 1777 sticky
+mkdir emptyroot emptymine; chown tester:tester emptymine
+mkdir listonly; f listonly/a.txt root:root 0644; f listonly/b.txt root:root 0644; chmod 0744 listonly
+mkdir writeonly; chmod 0733 writeonly
+mkdir rootdir700; chmod 0700 rootdir700
+mkdir rodos rodos/sub rodos2; f rodos/f.txt tester:tester 0644; chown tester:tester rodos rodos/sub rodos2
+mkdir mixed mixed/d; f mixed/a.txt tester:tester 0644; mkfifo mixed/b.fifo; f mixed/c.txt tester:tester 0644
+chown tester:tester mixed mixed/d mixed/b.fifo
+smbclient -s /dev/null //127.0.0.1/share -U 'TESTDOM\tester%testpass' \
+  -c "cd upload/$(basename "$PWD"); setmode dosro.txt +r; setmode rm-dosro.txt +r; setmode rodos +r; setmode rodos2 +r" >/dev/null
+"#;
+    docker_sh(s.container, &format!("cd {} && {SCRIPT}", sq(&s.server())));
+}
+
+/// The NT ACL fixture of the Stage 6 plan, 6.2, made as root on the DC in `s` (`s.container` is
+/// the DC's): a fresh DOS attribute on every object made outside Samba, then a check that each
+/// lists over SMB as what it is, then the ACLs, set with `smbcacls` as the DC's administrator.
+pub fn nt_fixture(s: &Scratch) {
+    assert_eq!(s.container, SAMBA_DC);
+    const MAKE: &str = r#"set -e
+d=upload/$(basename "$PWD")
+mkdir A C D E F G H I J
+for x in D/file.txt D/rm-file.txt D/denydel.txt E/file.txt E/rm-file.txt F/file.txt \
+         F/rm-file.txt H/nosync.txt I/own.txt I/rm-own.txt; do
+  echo "$x" > "$x"; done
+mkdir E/empty H/nosyncdir I/sub
+chmod -R 0777 A C D E F G H I J
+U='-U RSMB\Administrator%Adm1n-testpass'
+c=$(find A C D E F G H I J -print | sed 's|.*|setmode "&" -rsh|' | paste -sd ';' -)
+smbclient //127.0.0.1/share $U -c "cd $d; $c" >/dev/null
+"#;
+    docker_sh(s.container, &format!("cd {} && {MAKE}", sq(&s.server())));
+    // `setmode -rsh` clears R, S and H but keeps the directory bit: a file made on the inode of a
+    // directory whose record outlived it would list as a directory (and break F82 at random). Every
+    // object must list as what it is on disk (docs/plans/stage-6.md W11).
+    let dirs: BTreeSet<String> = docker_sh(
+        s.container,
+        &format!("cd {} && find . -mindepth 1 -type d", sq(&s.server())),
+    )
+    .lines()
+    .map(|l| l.trim_start_matches("./").to_string())
+    .collect();
+    let o = dc_smbclient(&format!("cd \"{}\"; recurse; ls", &s.remote()[1..]));
+    let listing = String::from_utf8_lossy(&o.stdout);
+    let top = format!("\\upload\\{}", s.name);
+    let mut dir = String::new();
+    let mut seen = 0;
+    for l in listing.lines() {
+        if let Some(h) = l.strip_prefix(&top) {
+            dir = h.trim_start_matches('\\').replace('\\', "/");
+            continue;
+        }
+        let mut f = l.split_whitespace();
+        let (Some(name), Some(attrs)) = (f.next(), f.next()) else {
+            continue;
+        };
+        if name == "." || name == ".." || !l.starts_with("  ") {
+            continue;
+        }
+        let path = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        };
+        let is_dir = dirs.contains(&path);
+        seen += 1;
+        assert!(
+            attrs.contains('D') == is_dir && !attrs.contains(['R', 'H', 'S']),
+            "nt_fixture: {path} is a {} made outside Samba but lists over SMB as `{attrs}`: a \
+             stale record in the DC's xattr.tdb on a reused inode (docs/test-environment.md, \
+             'How the DC keeps DOS attributes'). Recreate the DC under the exclusive lock: \
+             flock -x /tmp/rsmb-env.lock docker compose -f testenv/compose.yaml up -d \
+             --force-recreate --wait samba-dc",
+            if is_dir { "directory" } else { "file" }
+        );
+    }
+    // Checked after the entries: a file that lists as a directory also fails the recursion.
+    assert!(o.status.success(), "smbclient ls on the DC: {listing}");
+    assert_eq!(seen, 22, "nt_fixture: objects listed over SMB\n{listing}");
+    const ACLS: &str = r#"set -e
+d=upload/$(basename "$PWD")
+U='-U RSMB\Administrator%Adm1n-testpass'
+O='OWNER:RSMB\Administrator,GROUP:RSMB\Domain Users,ACL:RSMB\Administrator:ALLOWED/0x0/FULL'
+CO='ACL:CREATOR OWNER:ALLOWED/OI|CI|IO/FULL'
+t() { smbcacls //127.0.0.1/share "$d/$1" $U --set "$2" >/dev/null; }
+t A "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200ab"
+t C "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200ad,$CO"
+t D "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200e9"
+for x in D/file.txt D/rm-file.txt; do t $x "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x00120089"; done
+t D/denydel.txt "ACL:RSMB\\tester:DENIED/0x0/0x00010000,$O,ACL:RSMB\\tester:ALLOWED/0x0/0x00120089"
+t E "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200af,$CO"
+for x in E/file.txt E/rm-file.txt; do t $x "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x00130089"; done
+t E/empty "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200a9"
+t F "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200ab,$CO"
+for x in F/file.txt F/rm-file.txt; do t $x "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x00120089"; done
+t G "$O,ACL:RSMB\\Domain Users:ALLOWED/0x0/0x001200ab,$CO"
+t H "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200a9"
+t H/nosync.txt "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x00000081"
+t H/nosyncdir "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x00000081"
+t I "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200a9"
+for x in I/sub I/own.txt I/rm-own.txt; do t $x "$O,ACL:RSMB\\tester:ALLOWED/0x0/FULL"; done
+t J "$O,ACL:RSMB\\tester:ALLOWED/0x0/0x001200ab,ACL:RSMB\\tester:ALLOWED/OI|IO/READ"
+"#;
+    docker_sh(s.container, &format!("cd {} && {ACLS}", sq(&s.server())));
+}
+
+/// Runs each line in the session, in the order given, and returns per line None when it
+/// succeeded or the error's kind.
+pub fn outcomes(c: &mut Client, lines: &[String]) -> Vec<Option<String>> {
+    lines
+        .iter()
+        .map(|l| {
+            let r = c.cmd(l);
+            (!r.ok).then(|| r.kind().unwrap_or_else(|| "no error object".into()))
+        })
+        .collect()
+}
+
+/// The `access` objects of a reply by `name`, for `-e` runs.
+pub fn access_by_name(r: &Reply) -> BTreeMap<String, Value> {
+    r.of("access")
+        .into_iter()
+        .map(|v| (v["name"].as_str().unwrap().to_string(), v.clone()))
+        .collect()
 }
 
 /// The fixture's medium.bin as a local file (copied out of the container).

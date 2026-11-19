@@ -97,8 +97,8 @@ session; rsmb refuses that login (exit 3) and says to use `-u Guest --no-pass` o
   root stays at the root).
 - A token is a flag only if it is exactly one of the flags the command declares and comes before
   `--`; everything else is an argument, so `cd -rf` and `ls --help.txt` work on files with those
-  names. The flags without a value are exactly `-r` and `-f` (`get`, `put`) and `-p` (`mkdir`),
-  each its own token: `-rf` is not a flag, so a file called `-rf` stays reachable (`get -rf`).
+  names. The flags without a value are exactly `-r` and `-f` (`get`, `put`), `-p` (`mkdir`) and
+  `-e` (`access`), each its own token: `-rf` is not a flag, so a file called `-rf` stays reachable (`get -rf`).
   The first `--` is dropped.
 - **Flags that take a value** (`tree -L <n>`; `find -name`, `-iname`, `-type`, `-size`,
   `-maxdepth`): the next token is the value, whatever it is, so `find -name -rf` looks for the
@@ -127,15 +127,15 @@ session; rsmb refuses that login (exit 3) and says to use `-u Guest --no-pass` o
 
 - The first word completes to a command name. After `use`: share names (the share list is
   fetched once, 7 requests, on the first such Tab if `shares` has not run; Tab never asks for
-  the access). After `help`: command names and `all`. After `cd`, `mkdir`, `rmdir`, `tree`, `find`: remote directories; after `ls`, `get`, `cat`,
-  `rm` and as `put`'s second argument: remote directories and files. As `get`'s second argument,
+  the access). After `help`: command names and `all`. After `cd`, `mkdir`, `rmdir`, `tree`, `find`: remote directories; after `ls`, `access`, `get`,
+  `cat`, `rm` and as `put`'s second argument: remote directories and files. As `get`'s second argument,
   `put`'s first, and after `lcd` (directories only) and `lls`: **local paths**, read from the local
   directory with `read_dir` (with `~`), the same quoting and `/` after a directory, no request.
   After a flag that takes a value (`find -name `, `tree -L `) Tab offers nothing and sends
   nothing; flag names are not completed.
 - A remote path is completed from the cached listing of its directory. A directory that is not
   cached is listed once (5 requests); every further Tab there costs 0 requests until `refresh`.
-  `ls` refreshes the cached listing of the directory it shows; `tree` and `find` store every
+  `ls` and `access -e` refresh the cached listing of the directory they show; `tree` and `find` store every
   listing they fetched (not those of `get -r` and `put -r`), so Tab below a walked directory
   costs nothing. Two directories of one walk whose names differ only in letter case are stored
   by neither, nor is what is below them, even when the walk lists only one of them.
@@ -166,8 +166,8 @@ Lists every share of the server, hidden ones (ending in `$`) included, from srvs
   is FILE_READ_DATA, write is FILE_WRITE_DATA or FILE_APPEND_DATA. It is **not** a promise for
   every directory or file inside: a share can say `rw` while its root directory or a folder below
   refuses you (on the test server `share` says `rw`, yet only `upload/` takes new files from
-  `tester`). Per-directory access is not shown: a listing carries no rights, and asking would cost
-  an open per directory. Nothing is created on the server to find out.
+  `tester`). For a directory or a file inside, ask with `access` (one open per path; `access -e`
+  for every entry of a directory). Nothing is created on the server to find out.
 - Measured on Samba 4.23.8 as `tester`: `share`, `encrypted`, `tiny` `rw`; `readonly` (`read only =
   yes`), `guest` and `IPC$` `r-`. Anonymous: `guest` and `IPC$` `r-`, every other share `--`.
 - Costs: 7 requests in 7 flights for the list the first time on a connection (TREE_CONNECT to
@@ -292,6 +292,158 @@ Examples:
 - `ls` — list the working directory
 - `ls /sizes` — list the directory sizes below the share root
 - `ls "special/dir with space"` — list a directory whose name has spaces
+
+## `access`
+
+```
+access [-e] [<path>]
+```
+
+Shows which rsmb commands the server would allow on a path (default: the working directory),
+without trying any of them. With `-e` the path is a directory and every entry of it is shown
+instead of the directory itself. Nothing is created, changed or tried: each path is opened once
+for its attributes, with the CREATE context `SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST` (MxAc),
+and the server answers with the maximal access this login has to it (the **mask**). `cd` and `ls`
+are unchanged by this command; it is a separate question at its own cost.
+
+- **The columns.** A directory: `ls` (list it), `put` (a new file into it), `mkdir` (a directory
+  in it), `rmdir` (remove it). A file: `get` (and `cat`), `put` (`put -f` over it; `replace` in
+  `--json`), `rm`. Each column is the command's word when the server would allow it, `-` when it
+  would refuse it, `?` when rsmb cannot tell. There is no `cd` column: no bit of the mask predicts
+  `cd` (on a `read only` share no mask holds SYNCHRONIZE, which `cd` asks for, yet `cd` works
+  there), and trying `cd` costs 2 requests, less than asking.
+- **The rule.** `m` is the path's mask, `p` the mask of the directory it is in (asked in the same
+  compound; none at the share root), "read-only" the DOS attribute `FILE_ATTRIBUTE_READONLY`
+  (0x1) in a directory's CREATE answer:
+
+  | Column | Directory | File |
+  |---|---|---|
+  | 1 | `ls`: `m` has FILE_LIST_DIRECTORY (0x1) | `get`: `m` has FILE_READ_DATA (0x1) |
+  | 2 | `put`: `m` has FILE_ADD_FILE (0x2) → yes; otherwise `?` when the directory is read-only, else `-` | `put`: `m` has no DELETE (0x10000) → `-`; `p` has FILE_ADD_FILE → yes; otherwise `?` when the parent is read-only, else `-` |
+  | 3 | `mkdir`: `m` has FILE_ADD_SUBDIRECTORY (0x4) → yes; otherwise `?` when read-only, else `-` | — |
+  | 4 | `rmdir`: `m` has no DELETE → `-`; `p` has FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY or FILE_DELETE_CHILD (0x2, 0x4, 0x40) → yes; `p` has none of them → `?`; always `-` at the share root | `rm`: `m` has DELETE |
+
+  A column whose mask is unknown (the probe of the parent failed) is `?`, unless the path's own
+  mask already refuses it. Where the rule departs from the obvious bit, it follows what the
+  command really sends:
+  - `put` over a file is **not** FILE_WRITE_DATA on the file: `put -f` writes a temporary file in
+    the directory and renames it over the old one. On Samba a file in root's 0755 directory with
+    mode 0666 grants FILE_WRITE_DATA and is refused; root's 0644 file in your own directory lacks
+    it and is replaced.
+  - `rm` is DELETE on the file, **not** "or FILE_DELETE_CHILD on the parent": Samba's mask of a
+    file already holds what its directory allows, and the "or" is wrong in a sticky directory
+    (it has FILE_DELETE_CHILD, and someone else's file there cannot be removed).
+  - `rmdir` needs more than DELETE on the directory: on Unix permissions a directory's own mode
+    gives DELETE although only its parent decides. When the parent lets this login change nothing
+    the column is `?`: there Samba on Unix permissions refuses and Samba on NT ACLs allows, and no
+    mask tells the two apart (the user's decision, `docs/plans/stage-6.md` A7).
+  - `ls` and `get` do not require SYNCHRONIZE, although both opens ask for it: every mask on a
+    `read only` share lacks it, and both work there.
+  - In a directory with the DOS read-only attribute Samba drops FILE_ADD_FILE,
+    FILE_ADD_SUBDIRECTORY and DELETE from the mask but does not enforce the attribute on a
+    directory: its `put` and `mkdir` and the `put` over its files are `?`. Its own `rmdir` stays
+    `-` (Samba refuses it: `cannot be deleted`).
+- **Measured on Samba 4.23.8** (`docs/plans/stage-6.md` 2.3 to 2.7) as `tester` on `share`: the root
+  shows `d  ls  -   -     -`, `upload` `d  ls  put mkdir ?` (its parent, the root, lets nothing
+  change), `traverse-only` `d  -   -   -     -`, `traverse-only/known.txt` `-  get -         -`,
+  `forbidden` `d  -   -   -     -` (it grants nothing but its attributes). On `readonly` every
+  `put`, `mkdir`, `rm` and `rmdir` is `-` (the server applies `read only` to the mask; `put` and
+  `mkdir` of a directory with the DOS read-only attribute stay `?`); on
+  `guest` (anonymous, or `-u Guest --no-pass`) `ls` and `get` only; on `encrypted` the same as on
+  `share`. The answer is the same with NTLM and Kerberos, and it includes what a client cannot
+  see: membership of a group, the share's `read only`, the sticky bit for files (not for a
+  directory's `rmdir`, K3 below), the DOS read-only attribute of a file.
+- **What it does not tell:** whether a directory is empty (`rmdir` fails `not_empty`), whether a
+  name exists (`put` without `-f` onto an existing name fails `already_exists`), a file open
+  elsewhere (sharing violation), a full disk or a quota, rsmb's own refusals (`rmdir` of the
+  working directory or one above it, names of the temporary form, names SMB does not allow), and
+  a name the server lists but will not open for data (in `mangled/` all nine names open for
+  attributes, but four answer a read with `invalid_name`, so `access -e /mangled` shows `get` for
+  all nine). Samba lists a directory you may read but not enter (mode 0744, someone else's) as
+  empty, so `access -e` shows nothing there; an entry asked for by name is `access_denied`. The
+  answer is the server's at that moment, not a lock: act and check the exit code all the same.
+- **Where the server's answer and the command differ, on Samba** (every case measured;
+  `docs/known-limitations.md`):
+  - K1: a file with the DOS read-only attribute in a directory that takes files shows `put` `-`,
+    yet `put -f` replaces it (Samba's rename with replace does not look at the target's attribute).
+  - K2: on NT ACLs a file without DELETE in a directory with FILE_ADD_FILE shows `put` `-`, yet
+    `put -f` replaces it (the same: Samba does not check DELETE on the replaced file; Windows is
+    expected to).
+  - K3: on Unix permissions a directory that is `rwx` for you, owned by someone else, in a sticky
+    directory shows `rmdir`, yet `rmdir` is refused (the sticky bit is in no mask).
+  - K4: an NT ACL entry that grants read without SYNCHRONIZE shows `ls` / `get`, yet both are
+    refused (rsmb always asks for SYNCHRONIZE; Windows' ACL editor adds it to every entry it
+    writes).
+  - K7: a drop box, a directory with FILE_ADD_FILE whose inheritable ACL gives the creator of a new
+    file no DELETE, shows `put`, yet `put` writes its temporary file and cannot rename it
+    (`access_denied`, the temporary file named in `left_behind`).
+
+  An allowed column was wrong in three measured cases: two made on purpose (K3, K4) and an
+  ordinary drop box (K7); a refused one in two (K1, K2). Where no mask can decide, the column is
+  `?` (`rmdir` under a directory that lets nothing change; `put` and `mkdir` in a directory with
+  the DOS read-only attribute).
+- **Costs on Samba:** the path and its directory in one compound, **4 requests in 1 round trip**
+  (CREATE and CLOSE each); at the share root 2. A path whose directory does not exist: 6 in 2
+  (the server fails every request of a compound after a failed CREATE, so the path is asked again
+  on its own). With `-e`: the listing as `ls` (5 requests, 1 round trip), then 2 per entry plus 2
+  for the directory, up to 16 paths per compound and 256 paths in flight (1 more round trip up to
+  255 entries); every failure in a compound sends the paths after it again, one per compound, at
+  most one more round trip. At 100 ms each way (medians, `timing_access`): `access upload`
+  201.6 ms, `access -e /tree` 404.5 ms, `access -e /fanout` (2,000 entries) 1.9 s with its
+  listing; on a server with 16 credits one compound of 8 paths at a time.
+  Through a proxy the counts are the same.
+- **Nothing is printed before the last answer**, and there is no progress line: `access -e /huge`
+  (100,000 entries) takes about 22 s at the fast endpoint (22.2 and 22.5 s through rsmb, the
+  listing included; the probes alone 20.9 s) and about 80 s at 100 ms each way (computed for the
+  probes alone: 391 waves of 256 at 200 ms), silent until the end. Ctrl-C ends it (exit 130 in a script; the next command opens
+  a new connection). A connection that is closed in the middle fails every pending request at
+  once and the command runs once more on a new connection, the listing included; a server that
+  goes silent fails it after the deadline (`connection_lost`, not run again).
+- **Output:** one line per path: `d` or `-`, the four columns (3, 3, 5 and 5 characters wide, the
+  third blank for a file), the name: without `-e` the path from the share root with `/` after a
+  directory, with `-e` the entry's name, in the listing's order (by name). An entry of `-e` that
+  could not be asked about has `?` in every column and its error kind after the name. With
+  `--json` one `access` object per path, with the raw mask beside the named answers: a directory
+  carries `ls`, `put`, `mkdir`, `rmdir`, a file `get`, `replace`, `rm`, each `true`, `false` or
+  `null`.
+
+```
+d  ls  put mkdir rmdir  /upload/rsmb-test-1/
+d  ls  put mkdir ?      /upload/
+d  ls  -   -     -      /
+-  get put       rm     mine.txt
+-  -   put       rm     secret.txt
+-  get -         -      dosro.txt
+d  ls  -   -     rmdir  rodir/
+d  -   put mkdir rmdir  writeonly/
+d  ls  put mkdir ?      minedir/
+d  ls  ?   ?     -      rodos/
+-  ?   ?         ?      b.fifo  (other)
+```
+
+(`b.fifo` is a FIFO: Samba lists it and refuses to open it.)
+
+```
+{"attributes":16,"error":null,"is_dir":true,"ls":true,"mask":2032127,"mkdir":true,"name":"upload","path":"/upload","put":true,"rmdir":null,"type":"access"}
+{"attributes":128,"error":null,"get":true,"is_dir":false,"mask":1507743,"name":"mine.txt","path":"/upload/s/mine.txt","replace":true,"rm":true,"type":"access"}
+{"attributes":null,"error":"other","get":null,"is_dir":false,"mask":null,"name":"b.fifo","path":"/upload/s/b.fifo","replace":null,"rm":null,"type":"access"}
+```
+
+- **Errors:** without `-e` the path's own failure is the command's error: `not_found`,
+  `access_denied` (not even its attributes can be read, as `forbidden/secret.txt`),
+  `invalid_name`; `usage` without a selected share or with more than one path. With `-e` also
+  `not_a_directory` (`-e` of a file); an entry that cannot be asked about is a `?` line (an
+  object with `error`) and the command succeeds. So the same path is exit 1 alone and an object
+  with `error`, exit 0, as an entry of `-e`. `-e` is a flag only as its own token: a file called
+  `-e` is `access -- -e`.
+- The listing of `-e` refreshes the cached listing of the directory, as `ls` does, so Tab below it
+  costs nothing; the probes change nothing and invalidate nothing.
+
+Examples:
+
+- `access` — what you may do with the working directory
+- `access upload` — may you list upload, put a file into it, make a directory in it, remove it?
+- `access -e /tree` — the same for every entry of /tree, files and directories
 
 ## `tree`
 
@@ -540,8 +692,11 @@ Uploads a local file, or with `-r` a directory and everything below it.
   `left_behind`.
 - **Overwrite.** An existing remote file is not replaced without `-f`: `already_exists` (the
   interactive shell asks). Files above 256 KiB are checked before any data is sent (2 requests,
-  also with `-f`); smaller ones let the rename refuse (the temporary file is then deleted). A
-  directory is never replaced. A target that appears during a `put` without `-f` is not replaced.
+  also with `-f`; the check opens the target for its attributes only, so a file you may not read
+  is found too); smaller ones let the rename refuse (the temporary file is then deleted). A
+  directory is never replaced, also one you may not read (`is_a_directory` on both paths). A
+  large `put -f` over a file the server will not let you replace is refused by the rename after
+  the data has gone (`access_denied`, `the server refused to replace it …`; Stage 6 plan A14). A target that appears during a `put` without `-f` is not replaced.
 - **Cost on Samba**: a file of at most 256 KiB **7 requests in 3 round trips** (CREATE + WRITE +
   FLUSH, CLOSE, the rename CREATE + SET_INFO + CLOSE); refused because the target exists (no `-f`): 13 in 6 round trips; with `-f` onto an existing file
   the same 7 in 3 (`transfer_costs`).
@@ -759,7 +914,7 @@ Example:
   that sends: the same dial and login as at start-up, then the share is connected again on use.
   Share, working directory and cache stay. A reading command that lost its connection midway runs
   once more from its start on a new connection; it prints only after its last request, so nothing
-  is printed twice. `tree` is such a command. `find` prints while it walks, so it runs again only
+  is printed twice. `tree` and `access` are such commands. `find` prints while it walks, so it runs again only
   while it has printed nothing (the start's listing was lost, or nothing had matched); after its
   first line it fails with `'<line>' was not run again: the results above are incomplete`, and
   no `walk_summary` follows.
@@ -1012,6 +1167,8 @@ KRB5CCNAME=/tmp/krb5cc_rsmb rsmb -k --proxy socks5://127.0.0.1:1080 -H fs1.corp.
   is forwardable and renewable; with the service ticket in the cache both log in. Against a
   Windows KDC the checksum is the other way round: rsmb sends the RFC 4757 profile that a Windows
   KDC verifies, where the library rsmb builds on does not (V12 of `docs/plans/stage-5.md`).
+- smbclient-ng's `acls` prints each object's security descriptor; rsmb has no ACL display.
+  `access` asks the server what it allows and prints that as commands.
 - `shares` always shows the access to each share, from the TREE_CONNECT answer (1 more round
   trip for the whole list). smbclient-ng shows rights only with `shares -R`: per share a tree
   connect and a listing of the root, one after another, and it reports READ or NO ACCESS (its

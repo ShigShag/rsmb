@@ -1,12 +1,13 @@
 # Architecture
 
-How rsmb is built: the finished program, after Stage 5 (Kerberos from the ticket cache). The design is about round trips: one TCP
+How rsmb is built: the finished program, after Stage 6 (`access`: what may I do here). The design is about round trips: one TCP
 connection, one tree connect per share, `cd` in one compound, a directory listing in one compound,
 cached listings for completion, nothing sent between commands, transfers that keep up to 16 small
 files or one stream window in flight, walks that keep up to 16 listings in flight. The decisions
 behind it are in [`plans/master-plan.md`](plans/master-plan.md), [`plans/stage-1.md`](plans/stage-1.md),
 [`plans/stage-2.md`](plans/stage-2.md), [`plans/stage-3.md`](plans/stage-3.md),
-[`plans/stage-4.md`](plans/stage-4.md) and [`plans/stage-5.md`](plans/stage-5.md); this document
+[`plans/stage-4.md`](plans/stage-4.md), [`plans/stage-5.md`](plans/stage-5.md) and
+[`plans/stage-6.md`](plans/stage-6.md); this document
 describes the code as it is. The rules of
 transfers, each with its test, are in [`transfers.md`](transfers.md).
 
@@ -15,10 +16,10 @@ transfers, each with its test, are in [`transfers.md`](transfers.md).
 | File | Holds |
 |---|---|
 | `src/main.rs` | `Args` (clap) and `options()` (the flags as the manual prints them), the start-up rules (password, `-S`/`-C`/stdin), the runtime, signal handling, `run_blocking`, the non-interactive runner, exit |
-| `src/session.rs` | `Target`, `Proxy`, the dialer and the transport halves, login (NTLM, or Kerberos: the ticket cache, `krb5.conf`, rsmb's TGS exchange, the Kerberos messages), `Session` (connection, tree map, share, working directory, cache, kept share list, the registry of remote temporary files and the writer slot), the `cd` check and `open_close`, the listing (`plan`, the entry parser, both phases), the share list, `Cache` and its `invalidate`, reconnect, `Error`, `Kind`, `classify`, `valid_name` and `crate_path`, `Remote` (every request of a transfer, `mkdir`, `rm`, `rmdir`), `finish` and `cleanup`. **All use of `smb2` is in this file** |
+| `src/session.rs` | `Target`, `Proxy`, the dialer and the transport halves, login (NTLM, or Kerberos: the ticket cache, `krb5.conf`, rsmb's TGS exchange, the Kerberos messages), `Session` (connection, tree map, share, working directory, cache, kept share list, the registry of remote temporary files and the writer slot), the `cd` check and `open_close`, the listing (`plan`, the entry parser, both phases), the share list, `Cache` and its `invalidate`, the probe of `access` (`Rights`, `rights_request`, `maximal_access`, `probe_rights`, `answered`, `settle`, `Session::rights`), reconnect, `Error`, `Kind`, `classify`, `valid_name` and `crate_path`, `Remote` (every request of a transfer, `mkdir`, `rm`, `rmdir`), `finish` and `cleanup`. **All use of `smb2` is in this file** |
 | `src/transfer.rs` | `get`, `put`, `cat`: temporary names (`temp_name`, `is_temp_name`), `local_component`, `LocalTemp`, the target rules (`local_target`, `remote_target`), the recursive transfers, the local walk of `put -r`, `Progress` |
 | `src/walk.rs` | `walk`: the one traversal routine (16 listings in flight or waiting, results in queue order, a stop, the loop check by file id, the caps for servers without ids), generic over the function that lists a directory; `Listing`, `Dir`, `Report`. The pure parts of `tree` and `find`: `Glob`, `parse_size`, `parse_depth`, `Filter`, `draw_tree`, `end_report`, `TREE_MAX` |
-| `src/commands.rs` | `COMMANDS` (the command table), `CmdId`, `Arg`, `Args`, `run_line` (and the overwrite prompt's `Flow::Confirm`), argument and flag splitting (flags with a value), the command functions (`mkdir`, `rm`, `rmdir`, `lcd`, `lpwd`, `lls`, `tree`, `find` and their `run_walk` here; `get`, `put`, `cat` call `transfer`), `Out` (text or JSON lines, raw bytes for `cat`, item errors, `diag`, `written`), `entry_obj`, help rendering, time formatting |
+| `src/commands.rs` | `COMMANDS` (the command table), `CmdId`, `Arg`, `Args`, `run_line` (and the overwrite prompt's `Flow::Confirm`), argument and flag splitting (flags with a value), the command functions (`access` with its rule `allowed` and `access_line`, `mkdir`, `rm`, `rmdir`, `lcd`, `lpwd`, `lls`, `tree`, `find` and their `run_walk` here; `get`, `put`, `cat` call `transfer`), `Out` (text or JSON lines, raw bytes for `cat`, item errors, `diag`, `written`), `entry_obj`, help rendering, time formatting |
 | `src/shell.rs` | `tokenize`, `partial`, `quote`, the completer (remote and local paths), the prompt, history, the overwrite question, the interactive loop |
 
 Module dependencies: `main` → `shell`, `commands`, `session`; `shell` → `commands`, `session`,
@@ -369,6 +370,60 @@ the whole list (`?` for the shares without an answer) and then fails with `conne
 connection shows as an error in each answer of the compound, not as an error of the call, so
 `probe_access` looks at every answer.
 
+## `access`
+
+`access [-e] [<path>]` asks the server what this login may do with a path and shows it as rsmb's
+commands; nothing is created, changed or tried (`docs/commands.md`, `access`, has the rule and
+what was measured; `docs/plans/stage-6.md` the evidence).
+
+- **The probe** (`rights_request`): a CREATE with `FILE_READ_ATTRIBUTES` alone, `FileOpen`, create
+  options 0 (a file or a directory), share access read, write and delete, no oplock, and the
+  create context `MxAc` (`SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST`, no data), then a related
+  CLOSE. The context is built and read with the crate's public `create_context` codec
+  (`pack_contexts`, `parse_contexts`, `find`); no patch. `FILE_READ_ATTRIBUTES` because Samba
+  grants it on every object that can be reached, so a refused open never hides the mask (with
+  `cd`'s SYNCHRONIZE, `forbidden/` is refused although its mask holds a bit). `maximal_access`
+  takes `MaximalAccess` when the answer's `QueryStatus` is 0 and the data has 8 bytes, else `None`
+  (every column `?`). `Rights` keeps the mask, `is_dir` and the CREATE answer's file attributes
+  (the DOS read-only bit of a directory matters to the rule).
+- **The parent first, in the same compound.** Without `-e` the call asks for `[parent, path]` (the
+  share root alone: 2 requests): 4 requests in 1 flight. Through microsocks two separate compounds
+  cost a second round trip (Nagle on its socket to the server); one compound does not. The parent
+  goes first because a missing path is the common failure, and then the parent's answer is in hand
+  already.
+- **The cascade** (`answered`, `settle`). The crate marks every request after the first of a
+  compound as related, and Samba fails every request after a failed CREATE with that status. So a
+  chain's answers count up to its first failed CREATE; that failure itself counts only when it is
+  the chain's first CREATE or the CLOSE before it succeeded (otherwise it may be the CLOSE's
+  status passed on). `settle` puts the counted answers in their places by index and queues every
+  later path of the chain again, each in a compound of its own, behind what was queued; a path sent
+  alone cannot be cut again, so a failure costs at most one more round trip. Both are pure
+  functions with unit tests.
+- **The width** (`Session::rights`). Up to `ACCESS_CHAIN` (16) paths per compound, at most
+  min(credits ÷ 2, `PROBE_LIMIT` = 256) paths in flight, counted in paths so that the single-path
+  retries run as wide; the credits are read when the call starts (on edge, 16 credits: 8 per
+  compound, one compound at a time). Tasks on a `JoinSet`, each with a clone of the connection and
+  the tree; no timer of its own. A path `crate_path` refuses is `invalid_name` and is not sent.
+- **Errors of a whole chain.** A lost connection in any answer fails the call (`connection_lost`;
+  nothing has been printed, so `run_parsed` runs the command again). An error of
+  `execute_compound` itself that is not a lost connection means the compound never reached the
+  wire: every path of the chain gets it. A task that ended without a result (`JoinError`) may have
+  left requests on the wire: the connection is marked dead and the call fails with `other`.
+  `in_flight` is set for the whole call, so an interrupt replaces the connection (`abandon`).
+- **The rule** is `commands::allowed(rights, parent, root)`, the table of `docs/commands.md` (A7
+  of the plan). The mask is used as the server sent it, not ANDed with the tree's (Samba already
+  applies `read only`, and `Tree::connect` drops the tree's mask). `access_line` prints the
+  columns, `access_obj` the JSON object (a file's second column is `replace`).
+- **`-e`** lists the directory with `Session::list` (as `ls`: sorted, cached, so Tab below it is
+  free), then asks for the directory and every entry in one `rights` call; an entry whose probe
+  failed is a `?` line, not the command's error. Everything is printed after the last answer
+  (`rerun: true`), so a run again after a cut prints nothing twice; there is no progress line.
+
+`access` is a `Session` method like `ls` and `shares` (it creates nothing and needs no registry).
+`cd` and `ls` are untouched. `Remote::stat`, the check before a large `put`, asks for
+`FILE_READ_ATTRIBUTES` only since this stage (A14); `cd` and `mkdir` keep `open_close` with `cd`'s
+mask.
+
 ## Timeouts, dead connections, reconnect, interruption
 
 - **The deadline.** The only timer on requests is the crate's response deadline (`--timeout`,
@@ -411,7 +466,7 @@ connection shows as an error in each answer of the compound, not as an error of 
   deadline once more. Nor is a command that started on a dead connection (`Session::is_dead`)
   run again when its reconnect fails: that would dial twice (20 s instead of 10 s) and report the
   second failure. The next command that sends reconnects. The navigation commands that send
-  (`shares`, `use`, `cd`, `ls`) may rerun, and so does `tree`; they print only after their last
+  (`shares`, `use`, `cd`, `ls`, `access`) may rerun, and so does `tree`; they print only after their last
   request (`shares` prints its list, then fails if the access probe lost the connection, so the
   rule below, nothing that has printed is run again, applies to it too). The transfer and file commands that send (`get`, `put`, `cat`, `mkdir`, `rm`, `rmdir`) do not:
   their error gets the tail `'<line>' was not run again and may or may not have taken effect`.
@@ -457,7 +512,8 @@ declares a flag with a value by a space in its name (`"-L <n>"`, `"-name <glob>"
 flag the next token is its value whatever it is (`find -name -rf`), `opts` keeps `(flag, value)`,
 and `open` is set when the line ends before the value. `parse` turns `open` and a flag with a
 value given twice into usage errors; `opt(a, name)` reads a value; `positional_index` returns
-`None` while a value is open, so the completer offers nothing there. Dispatch gets `&Args`;
+`None` while a value is open, so the completer offers nothing there. The flags without a value
+are `-r`, `-f` (`get`, `put`), `-p` (`mkdir`) and `-e` (`access`). Dispatch gets `&Args`;
 `transfer::get` and `put` keep `(flags, positionals)`. `run_line(sess, out, line, force)`: with `force` the command runs as if `-f` had been given. When a single `get` or
 `put` (no `-r`, no `-f`) fails with `already_exists` and `out.interactive` is set (only
 `shell::run` sets it), `run_line` prints nothing and returns `Flow::Confirm(message)`; the shell
@@ -498,7 +554,9 @@ with `quote(dir part + name)` plus `/` or a space; prefixes match by exact bytes
 reach the server: a clone of the connection and of the tree, the walk's buffer size, the small-file
 threshold (`small` = min(256 KiB, negotiated read and write size)), and handles on the session's
 registry, writer slot and dirty flag, plus the sender half of a channel. No `smb2` type appears in
-its methods: `list` (a walk listing, 4 requests, 1 flight), `stat` (2 / 1; `None` for not found),
+its methods: `list` (a walk listing, 4 requests, 1 flight), `stat` (2 / 1; `None` for not found;
+the open asks for `FILE_READ_ATTRIBUTES` alone, so a file or directory one may not read is found
+too: Stage 6, A14),
 `mkdir(path, existing_ok)` (2 / 1; `FileCreate`, or `FileOpenIf` which also opens an existing
 directory and answers `NOT_A_DIRECTORY` for a file), `remove(path, dir)` (3 / 1), `read_small`
 (3 / 1), `download` (the stream path down, into a sink), `put_small` and `upload` (5.3 of the plan;

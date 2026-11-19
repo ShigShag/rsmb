@@ -195,7 +195,7 @@ What is in the realm, and why:
 | SPN `cifs/10.213.45.10` | a valid ticket for `samba`, which does no Kerberos: the server's refusal of a ticket |
 | share `share` (`/srv/share`): `hello.txt` (`kerberos works` and a newline), `sub/1m.bin` (1,048,577 bytes: the numbers from `seq 1 200000`), `upload/` (mode 1777) | a listing, a read with a checksum, a write. Files written over SMB belong to the id Samba maps the realm's user to, so a test's scratch directory is made with mode 1777, not owned by a Unix user |
 | share `encrypted` (the same path, `smb encrypt = required`) | encryption with a Kerberos session key |
-| the admin password `Adm1n-testpass` | a throwaway value inside a local image |
+| the admin password `Adm1n-testpass` | a throwaway value inside a local image; the tests use it inside the DC at run time for `smbcacls` and `smbclient` (the NT ACL fixture of `access`, and the DOS attributes of every scratch directory, below) |
 
 `mkcache -f|-F <user> [<spn>…]` (in the image, `/usr/local/bin/mkcache`) runs `kinit` for
 `<user>@RSMB.TEST` (password `testpass`) into a temporary file cache with a ticket-granting
@@ -208,6 +208,69 @@ an expired ticket is made by rewriting a copy of a cache, not by waiting; and a 
 ticket for five minutes after its end (clock allowance). It answers a TGS request over UDP with
 `KRB5KRB_ERR_RESPONSE_TOO_BIG` (the reply is about 1,500 bytes), so a client that starts with UDP
 pays one round trip for nothing here.
+
+**The DC is the only server with NT ACLs** (`acl_xattr`): the main Samba servers derive NT rights
+from Unix modes. The `access` tests (Stage 6) make their NT ACLs at run time in their scratch
+directory with `smbcacls //127.0.0.1/share … -U 'RSMB\Administrator%Adm1n-testpass' --set …`
+inside the DC (smbd serves the change at once; `xattr_tdb` keeps the ACL in a file, so no
+privilege is needed; about 1.9 s for the whole fixture). Nothing in the image changed for it.
+
+**How the DC keeps DOS attributes, and why the tests remove through Samba.** With `xattr_tdb`
+the DC keeps DOS attributes and NT ACLs in `/var/lib/samba/xattr.tdb`, **keyed by the file's
+inode** (device and inode, 16 bytes), not on the file. A record outlives its object when the
+object is removed outside Samba (`rm -rf` in the container) and when Samba's own rename with
+replace drops the replaced file; the next object made outside Samba that gets that inode inherits
+the old record. Measured: a file set `+r` over SMB and removed with `rm -f`, the next file made
+with `docker exec` took inode 18889957 and showed `R`; the same after `rename new.txt old.txt -f`
+over an `R` file. **A directory's record keeps the directory bit:** three directories made over
+SMB and removed with `rmdir` in the container, then eight files made in the container: three of
+them took the directories' inodes (18891526, 18891558, 18891628) and listed as `D 0`, `setmode
+-rsh` left `attributes: D (10)` (it clears R, S and H, never D), and `deltree` of their parent
+failed with `NT_STATUS_NOT_A_DIRECTORY listing …\f3\*`. A stale NT ACL is ignored when the
+object's Unix mode no longer matches the hash stored with it (a directory made in the container
+on the inode of one whose ACL was set with `smbcacls` showed the ACL derived from its mode).
+**Through SMB nothing goes stale**: an object created over SMB gets a fresh DOS attribute
+(Samba writes one when it creates), and one removed over SMB (`rm`, `rmdir`, `deltree`) takes its
+record with it (measured: no record left for any of five objects after `deltree`). The main servers keep the attribute on the
+file itself and do not leak.
+
+So, on the DC only:
+
+- `Scratch`'s `Drop` removes its directory **through Samba** before `rm -rf`: one `smbclient`
+  call as the administrator (root to Samba, so no ACL of a fixture stops it), `setmode "<path>"
+  -rsh` for the directory and everything in it (`deltree` refuses a read-only object with
+  `NT_STATUS_CANNOT_DELETE`), then `deltree <name>`. A failure is printed, not raised. The
+  `stale test directories` step of `./test.sh` does the same for every `upload/rsmb-test-*` left
+  on the DC (a test killed before its `Drop`).
+- `Scratch::new` makes its directory in the container, clears its flags over SMB (`smbclient …
+  -c "cd upload; setmode <name> -rsh; allinfo <name>"`; `setmode .` is refused, so a directory is
+  cleared from its parent) and checks that it lists as `attributes: D (10)` with the ACL Samba
+  derives from root's mode 1777 (`smbcacls`, compared with `DC_SCRATCH_ACL`). Otherwise the inode
+  carried a record that outlived a replaced file: the directory is removed with `rmdir` over SMB
+  (which drops the record) and made again, at most three times.
+- `nt_fixture` clears the flags of every object it makes in the container (`setmode -rsh`) and
+  then lists them over SMB (`recurse; ls` as the administrator): a file that lists with `D`, a
+  directory without it, or any `R`, `H` or `S` fails the test at once with a message that names
+  the path, the stale record and how to recreate the DC.
+- No test replaces a read-only file on the DC: the replaced file's record cannot be reached by
+  any path afterwards. F82's `put -f notes.txt E/file.txt` and `put -f notes.txt F/file.txt` (K2)
+  replace files whose records hold an NT ACL only: two such records per run of F82 (counted: 4
+  after `./test.sh fast`, 8 after two more runs of F82 each way, none from the rest of
+  `tests/fast`), harmless while the stored hash does not match the new object's mode, and caught
+  by `Scratch::new` for its directory if it ever does.
+
+Without this an exact-mask test fails at random by inode reuse, a stale `R` refuses `rm`, and a
+file with a directory's record breaks `ls` of its parent (`docs/plans/stage-6.md` 2.13, W11).
+`access_predicts_nt_acls` first asserts that its scratch directory's mask is 0x001f01ff and its
+attributes 0x10.
+
+**Stale records already in a DC.** The DC keeps its state in the container (no volume), so
+recreating the container drops every record: under the exclusive lock, `flock -x
+/tmp/rsmb-env.lock docker compose -f testenv/compose.yaml up -d --force-recreate --wait samba-dc`
+(seconds). Counted with python's `tdb` module in the container (records whose device and inode no
+file has): before the fix 293 such records on the share's device, 83 of them with a DOS attribute
+and 16 with the directory bit; after recreating 0 (the 12 records of the image's build carry the
+build's device and never match).
 
 No capability, no volume, no connection counter (`ctl.sh conns` and `evict` do not apply): the
 tests count connections in their taps and KDC requests in the KDC's log. The healthcheck looks for
@@ -301,8 +364,11 @@ What Samba 4.23.8 does with them, measured with `smbclient` and checked by `chec
 - The nine Windows-illegal names in `mangled/` are listed as 8.3 mangled names such as
   `C69YSY~1.TXT` (mangled names are hashes and can change with the Samba version). The four whose
   original contains a DOS wildcard character (`?`, `*`, `<` and `>`, `"`) cannot be opened by
-  their mangled name: `NT_STATUS_OBJECT_NAME_NOT_FOUND`. The other five (`:`, `|`, `\`, trailing
-  dot, trailing space) can.
+  their mangled name: `NT_STATUS_OBJECT_NAME_NOT_FOUND` (measured with `smbclient`). The other
+  five (`:`, `|`, `\`, trailing dot, trailing space) can. Over rsmb's own CREATE (Stage 6) all
+  nine open for their attributes (masks 0x00120089), but the four answer an open for data with
+  `OBJECT_NAME_INVALID` (`cat mangled/LUI9XK~T.TXT`: `invalid_name`), so `access -e /mangled`
+  shows `get` for all nine.
 - The three legacy-encoded names are **not listed at all**: Samba logs
   `Conversion error: illegal character` and skips them. The plan expected them to appear mangled;
   they do not, and no Samba option was found that would present them. A client therefore cannot
@@ -447,9 +513,13 @@ direct, as `dc.rsmb.test` through the proxy).
 "Stale test directories" removes `upload/rsmb-test-*` on the three Samba containers and the DC with
 `docker exec`. Every test that writes to a server does it below a scratch directory of its own,
 `upload/rsmb-test-<pid>-<n>` (owned by tester, removed when the test ends, also when it fails);
-`tiny` is used by one test only, which empties it. Each step prints its duration; the last line
+`tiny` is used by one test only, which empties it. A fixture a test needs for itself alone is made
+there at run time: the `access` tests (Stage 6) make a POSIX fixture as root with `docker exec`
+(owners, modes, a sticky directory, a FIFO, the DOS read-only attribute set over SMB from inside
+the container; 0.15 s; `posix_fixture`) and an NT ACL fixture on the DC (`nt_fixture`, above); both
+are written out in `docs/plans/stage-6.md` section 6. Each step prints its duration; the last line
 prints the counted time against the budget (150 s for `fast`, 600 s full; Stage 1 had 90 and 240,
-Stage 2 120 and 420, Stage 3 120 and 540; Stage 5 kept 150 and 600). The measured times are in `docs/testing.md`.
+Stage 2 120 and 420, Stage 3 120 and 540; Stages 5 and 6 kept 150 and 600). The measured times are in `docs/testing.md`.
 
 The tests of `tree` and `find` compare with the server's own `find`, run in the container **as
 tester** (`docker exec -u tester -w /srv/share …`), so it sees what the SMB user sees (as root it

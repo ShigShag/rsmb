@@ -229,9 +229,23 @@ same.
   (CREATE + SET_INFO + CLOSE; a refused SET_INFO costs one more, standalone CLOSE), `delete_file`
   and `delete_directory` (CREATE + SET_INFO + CLOSE; an exclusive open first, a shared one after a
   sharing violation). Our own `open_close` compound (CREATE + CLOSE, the CREATE's answer decides)
-  carries `cd`, the existence check of an upload, `mkdir` (`FileCreate`) and `mkdir -p` /
-  `put -r` (`FileOpenIf` with the directory flag: creates, opens an existing directory, answers
-  `NOT_A_DIRECTORY` for a file).
+  carries `cd`, `mkdir` (`FileCreate`) and `mkdir -p` / `put -r` (`FileOpenIf` with the directory
+  flag: creates, opens an existing directory, answers `NOT_A_DIRECTORY` for a file). The existence
+  check of an upload (`Remote::stat`) is the same compound with `FILE_READ_ATTRIBUTES` alone and
+  no directory flag (Stage 6, A14: with `cd`'s SYNCHRONIZE Samba refused it on a file one may
+  replace but not read).
+- **`access` (Stage 6): the maximal access through MxAc, no patch.** `smb2::msg::create_context` is
+  public: `CreateContext::new(b"MxAc", vec![])`, `pack_contexts` into the `create_contexts` of our
+  own `CreateRequest`, and `parse_contexts` / `find` on the answer's `create_contexts` (8 bytes:
+  `QueryStatus`, then `MaximalAccess`). The crate packs an empty context with `DataOffset` 0.
+  Every successful CREATE of the planning runs (more than 130,000 probes, on all four servers, as
+  NTLM, anonymous, Guest and Kerberos) answered with the context and `QueryStatus` 0. **Every
+  request after the first of a compound is sent as related**, and Samba fails every request after
+  a failed CREATE with that CREATE's status (a chain of seven probes with the second missing:
+  OBJECT_NAME_NOT_FOUND for all six after it, existing paths included). A chain's answers are
+  therefore trusted only up to its first failed CREATE, and the paths after it are asked again,
+  each alone (`answered`, `settle`; `docs/architecture.md`, `access`). A shares chain of
+  TREE_CONNECTs does not cascade; a CREATE chain does.
 
 ## Library behaviours later stages must design around
 

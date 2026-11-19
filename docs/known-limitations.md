@@ -1,6 +1,6 @@
 # Known limitations
 
-What rsmb does not do, does differently, or was not tested, for the finished program (all five
+What rsmb does not do, does differently, or was not tested, for the finished program (all six
 stages): the client's own limits by topic, the scope, the server tested against, the library
 (`smb2` 0.43.0, `docs/library-decision.md`) and the test environment. The rules of transfers are
 in [`transfers.md`](transfers.md), the proxy's behaviour in [`commands.md`](commands.md), "Proxy".
@@ -84,8 +84,8 @@ recorded in `docs/plans/stage-4.md`, "Deviations during implementation".
 - **The access column** of `shares` is the share-level `MaximalAccess` the server reports in its
   TREE_CONNECT answer for this login. It does not say whether a given directory or file inside can
   be read or written: the share `share` says `rw` while its root directory refuses `tester` new
-  files. rsmb shows no per-directory access (a listing carries no rights; asking would cost an
-  open per directory). Only Samba 4.23.8 was measured (`share`, `readonly`, `guest`, `encrypted`,
+  files. For a directory or file inside, `access` asks the server (one open per path; see the
+  section `access` below for what it does not tell). Only Samba 4.23.8 was measured (`share`, `readonly`, `guest`, `encrypted`,
   `tiny`, `IPC$`, 300 read-only shares on edge, anonymous refusals); what Windows or other servers
   put into `MaximalAccess` was not checked. Read is FILE_READ_DATA and write FILE_WRITE_DATA or
   FILE_APPEND_DATA; DELETE, which Samba also grants on `read only = yes` shares, is not shown.
@@ -197,9 +197,18 @@ recorded in `docs/plans/stage-4.md`, "Deviations during implementation".
 - A directory reached twice (a link, or a server that reuses file ids across file systems under one
   share) is copied once and reported; a local tree that loops through a bind mount is cut at the
   loop. A walk on a server without file ids stops after 100,000 directories and says so.
-- **The read-only attribute is untested**: this Samba does not present mode 0444 as read-only, so
-  what `rm` or a replacing rename does to a read-only file on Windows was not seen. rsmb reports the
-  server's status and does not clear the attribute.
+- **The DOS read-only attribute** (set over SMB; this Samba does not present mode 0444 as
+  read-only): `rm` of such a file is refused (`other`, `cannot be deleted (read-only?)`), and
+  `put -f` over it **replaces it** on Samba, whose rename with replace does not look at the
+  target's attribute (Stage 6, K1). What Windows does was not seen. rsmb reports the server's
+  status and does not clear the attribute.
+- **The check before a large `put`** opens the target for its attributes only (Stage 6, A14): a
+  large `put -f` over a file the server will not let you replace (someone else's file in a sticky
+  directory) uploads every byte and is then refused by the rename (the temporary file removed):
+  the data crosses the link for nothing (50 MiB at 100 ms each way: 7.3 s instead of 1.4 s when
+  the check refused it, which it did only because it could not open the file at all). `put`
+  without `-f` over a file you may not read says `already_exists`; onto a directory you may not
+  read, `is_a_directory`.
 - One file per `rm`, no pattern, no recursion; `rmdir` removes an empty directory only.
 - **Leftovers after `kill -9`** (or a crash, or power loss): a `.rsmb-….part` stays where the data
   was going, locally or on the server; the next transfer of the same name removes it (locally it
@@ -375,9 +384,64 @@ recorded in `docs/plans/stage-4.md`, "Deviations during implementation".
   nothing goes around the proxy rests on the KDC's log naming each request's source address,
   with a control that shows a direct request as such.
 
+## `access`
+
+`access` shows the server's answer (MxAc: the maximal access of this login) as rsmb's commands,
+by the rule of `commands.md`. Everything below was measured on Samba 4.23.8 (`docs/plans/stage-6.md`
+2.4 to 2.7, 2.13) and is pinned by `access_predicts_posix` and `access_predicts_nt_acls`.
+
+- **Where it says yes and the command fails** (three measured cases):
+  - K3: on Unix permissions, a directory that is `rwx` for you but someone else's, in a sticky
+    directory (root's 0777 in root's 1777): `rmdir` shows allowed and is refused. The directory's
+    own mode gives DELETE; the sticky bit is in no mask (the sticky directory grants what any
+    writable one does).
+  - K4: an NT ACL entry that grants read data without SYNCHRONIZE (0x81, made by hand with
+    `smbcacls`): `get` and `ls` show allowed and are refused, because rsmb and the library always
+    ask for SYNCHRONIZE. The rule cannot require it: on a `read only` share no mask has it, yet
+    those opens work there. Windows' ACL editor adds SYNCHRONIZE to every allow entry it writes
+    (not verified).
+  - K7: a drop box, a directory with FILE_ADD_FILE whose inheritable ACL gives the creator of a
+    new file no DELETE (and no CREATOR OWNER entry): `put` shows allowed; `put` writes its
+    temporary file and the rename, which needs DELETE on it, is refused (`access_denied`, the
+    temporary file named in `left_behind` and left on the server). The inherited ACL is not in the
+    directory's mask. An ordinary ACL, not a constructed one.
+- **Where it says no and the command succeeds** (two measured cases): K1, a file with the DOS
+  read-only attribute in a directory that takes files, and K2, an NT ACL file without DELETE in a
+  directory with FILE_ADD_FILE: `put` (`put -f` over it) shows refused, yet Samba's rename with
+  replace replaces it, looking neither at the attribute nor at DELETE on the target. Windows is
+  expected to refuse both (not verified), so the rule keeps them.
+- **Where it says `?`**: `rmdir` of a directory that grants DELETE when its parent lets you change
+  nothing (Samba on Unix permissions refuses, `rodir2/minedir`; Samba on NT ACLs allows, `I/sub`;
+  no mask tells them apart: the user's decision); `put` and `mkdir` in a directory with the DOS
+  read-only attribute, and `put` over its files (Samba drops FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY
+  and DELETE for the attribute but does not enforce it on a directory); every column when the
+  server sent no MxAc answer (none in the test environment does).
+- **What it does not tell:** whether a directory is empty, a name exists, a file is open elsewhere,
+  the disk is full or a quota is reached, and rsmb's own refusals (`rmdir` of the working
+  directory, names of the temporary form, names SMB does not allow). A name the server lists but
+  will not open for data shows `get`: in `mangled/` four of the nine names answer a read with
+  `invalid_name`. A directory you may read but not enter (Samba, mode 0744, someone else's) is
+  listed as empty, so `access -e` shows none of its entries.
+- **It is a moment's answer**, not a lock: what it says can change before the command runs.
+- **No output before the end** of a large `access -e` and no progress line: `-e /huge` (100,000
+  entries) takes about 22 s at the fast endpoint (measured through rsmb) and about 80 s at 100 ms
+  each way (computed for the probes alone), silent until the last answer. On a server with 16 credits the probes go 8 per compound, one
+  compound at a time (2,000 entries on edge: 0.9 s on the fast link, about 50 s computed at 100 ms
+  each way).
+- **Samba only.** Whether a Windows server's MaximalAccess includes DELETE granted by the parent's
+  FILE_DELETE_CHILD (Samba's does), whether its rename with replace checks DELETE on the replaced
+  file, whether a `FILE_READ_ATTRIBUTES` open succeeds on every object a user reaches through
+  bypass-traverse, how it treats a directory's DOS read-only attribute in the mask, and whether
+  its MaximalAccess drops the write bits on a share with read-only share permissions were not
+  checked. Nor was a server that accepts a related CREATE after a CLOSE and answers it on its own
+  merits only when everything before it succeeded, other than Samba 4.23.8.
+- It shows no ACL, owner or security descriptor (ACL display is out of scope), and it is not the
+  client's evaluation of one: group membership, the share's `read only`, the sticky bit and the DOS
+  attribute are only in the server's answer.
+
 ## Out of scope (from `docs/brief.md`)
 
-ACL display, the module system, several simultaneous sessions, mount, and the remaining
+ACL display (`access` shows a verdict, not a descriptor), the module system, several simultaneous sessions, mount, and the remaining
 smbclient-ng commands. Authentication covers user/password/domain, guest, anonymous and Kerberos
 from a ticket cache; other methods are out of scope. NT-hash login does not exist in `smb2`.
 

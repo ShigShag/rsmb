@@ -19,7 +19,7 @@ proxy like every other (`big_file_through_the_proxy`, `cut_through_the_proxy`,
 
 | Path | Used for | Down | Up |
 |---|---|---|---|
-| **stream** | every single-file `get` and `cat`; a single `put` of more than the threshold; in a recursive transfer every file above the threshold | `Tree::download`: CREATE + 4 QUERY_INFO in one flight, READs of 512 KiB (the server's read size if smaller) with at most 4 MiB requested and not delivered, CLOSE | a check of the target (CREATE + CLOSE, 2 requests), `Tree::create_file_writer_exclusive` (CREATE + 3 QUERY_INFO), WRITEs of 512 KiB with at most 4 MiB unconfirmed, FLUSH, CLOSE, then the rename |
+| **stream** | every single-file `get` and `cat`; a single `put` of more than the threshold; in a recursive transfer every file above the threshold | `Tree::download`: CREATE + 4 QUERY_INFO in one flight, READs of 512 KiB (the server's read size if smaller) with at most 4 MiB requested and not delivered, CLOSE | a check of the target (CREATE + CLOSE, 2 requests; the open asks for `FILE_READ_ATTRIBUTES` only), `Tree::create_file_writer_exclusive` (CREATE + 3 QUERY_INFO), WRITEs of 512 KiB with at most 4 MiB unconfirmed, FLUSH, CLOSE, then the rename |
 | **small** | in a recursive transfer every file of at most the threshold; a single `put` of at most the threshold | `Tree::read_file_compound_sized_with_info`: CREATE + READ + CLOSE in one compound, 3 requests, 1 flight | `Tree::write_file_compound_exclusive` (CREATE + WRITE + FLUSH, then CLOSE: 4 requests, 2 flights), then the rename (3 requests, 1 flight): 7 requests, 3 flights |
 
 - **The threshold** is 256 KiB, lowered to the server's negotiated read and write size (64 KiB on
@@ -30,6 +30,16 @@ proxy like every other (`big_file_through_the_proxy`, `cut_through_the_proxy`,
   stream path (the compound read answers "too large").
 - No compound of our own carries file data; rsmb has no chunk scheduler. All `smb2` calls are in
   `src/session.rs` (`Remote`).
+- **The check** before a large `put` (`Remote::stat`, also the `stat` after a refused rename)
+  opens the target with `FILE_READ_ATTRIBUTES` and nothing else, which Samba grants on every
+  object that can be reached. Until Stage 6 it asked for `cd`'s `FILE_READ_ATTRIBUTES |
+  SYNCHRONIZE`, which Samba refuses on an object that grants nothing but its attributes (root's
+  0600 file in your own directory, root's 0700 directory): a large `put -f` over such a file was
+  refused before any data although a small one replaced it, and `put` onto such a directory said
+  `already_exists` (small) or `access_denied` (large) instead of `is_a_directory`. The user decided
+  the change knowing every effect (Stage 6 plan A14, 2.13); the overwrite table, the rename's
+  wording and the failure matrix below are as it is now (`put_over_a_file_without_synchronize`,
+  `put_f_refused_by_the_rename`).
 
 **In memory:** stream path: the crate's window (at most 4 MiB), one chunk, and for an upload the
 512 KiB read buffer. Small path: at most 16 files of at most 256 KiB (an upload twice: the crate
@@ -117,7 +127,7 @@ words the error by one rule (`rename_errors_have_one_wording`):
 
 | Refusal | Target found by a `stat` (2 requests) | Error |
 |---|---|---|
-| collision | a directory | `is_a_directory`: `<final>: is a directory; write '<final>/' to put the file into it`, with or without `-f` (Samba refuses a rename onto a directory even with replace) |
+| collision | a directory | `is_a_directory`: `<final>: is a directory; write '<final>/' to put the file into it`, with or without `-f` (Samba refuses a rename onto a directory even with replace), also for a directory you may not read (the `stat` asks for its attributes only) |
 | collision, no `-f` | a file | `already_exists`: `<final>: exists on the server; -f replaces it` |
 | collision, `-f` | a file | `other`: `<final>: the server did not replace it` |
 | access denied, `-f` | — | `access_denied`: `<final>: the server refused to replace it (open in another program, read-only, or not permitted)` |
@@ -135,9 +145,9 @@ the handle on its own. A small `put` refused because the target exists (without 
 | `get`, local target exists | `already_exists`, 0 requests, exit 1; in the interactive shell `Overwrite? [y/N]` | replaced by the rename when the download is complete |
 | `get`, the target appears during the download | `already_exists` from the hard link; the file that appeared untouched | the same (only what was there at the start is replaced) |
 | `get`, the target is a directory | `is_a_directory`, 0 requests | the same |
-| `put`, large, remote target exists | `already_exists` from the check, 2 requests, nothing created | replaced by the server in the rename |
+| `put`, large, remote target exists | `already_exists` from the check, 2 requests, nothing created; also for a file you may not read (before Stage 6: `access_denied`) | replaced by the server in the rename; also a file you may not read but may replace (before Stage 6 the check refused it) |
 | `put`, small, remote target exists | `already_exists` from the rename; the temporary file deleted | replaced |
-| `put`, the remote target is a directory (no trailing `/`) | `is_a_directory` with the hint to write `<name>/`: large from the check, small from the rename and the `stat` after it | the same |
+| `put`, the remote target is a directory (no trailing `/`) | `is_a_directory` with the hint to write `<name>/`: large from the check, small from the rename and the `stat` after it; also a directory you may not read (before Stage 6: `access_denied` large, `already_exists` small) | the same |
 | `put`, the target appears during the upload | `already_exists` from the rename; the file that appeared untouched | replaced |
 | recursive, a file target exists | one `error` (`already_exists`, with `path`) per file, the rest goes on, exit 1, no prompt | replaced, file by file |
 | recursive, a directory target exists | used as it is: directories are merged, never replaced | the same |
@@ -260,7 +270,8 @@ step 3 carries no data request.
 |---|---|---|---|---|
 | the target exists, no `-f` | nothing touched, nothing sent | large: nothing created; small: temp written, then deleted | `already_exists`, exit 1 (or the prompt) | `overwrite_rules`, `overwrite_prompt`, `transfer_costs` |
 | the target appears during the transfer (`get` with or without `-f`, `put` without) | temp removed; the file that appeared untouched | temp deleted; the file that appeared untouched | `already_exists`, exit 1 | `target_appears_during_get`, `target_appears_during_put` |
-| the remote target is a directory | — | large: nothing created; small: temp written, then deleted | `is_a_directory` with the hint, exit 1, also with `-f` | `overwrite_rules` |
+| the remote target is a directory | — | large: nothing created; small: temp written, then deleted | `is_a_directory` with the hint, exit 1, also with `-f`, also when you may not read it | `overwrite_rules`, `put_over_a_file_without_synchronize` |
+| `put -f`, large, over a file the server will not let you replace (someone else's file in a sticky directory) | — | every byte uploaded, then the rename refused; temp deleted, target untouched. Before Stage 6 the check refused such a file before any data only when it could not open it at all (50 MiB at the slow endpoint: 7.3 s now against 1.4 s then) | `access_denied`: `the server refused to replace it …`, exit 1 | `put_f_refused_by_the_rename` |
 | the source or the target name has the temporary form | nothing sent | nothing sent | `invalid_name`, exit 1 | `structure_round_trip` |
 | the source cannot be read (missing, denied, a directory) | nothing created | nothing created | the kind, exit 1 | `single_transfer_arguments`, `read_only_share` |
 | the remote disk is full | — | the error comes from `finish`; temp deleted; old file untouched | `disk_full`, exit 1 | `disk_full_tiny` |

@@ -130,3 +130,11 @@ Speed targets, measured in the integration tests:
    nothing goes around the proxy. `--keep-going` keeps only its long form. Work stays in this
    repository; each stage is pushed to `origin` and also to the public repository
    `ShigShag/rsmb`. Commit messages carry no AI attribution (no `Co-Authored-By`, no session link).
+10. **Stage 6: `access`** (2026-11-19). "Right now there's no way for me to check the permissions
+   on files I have listed in a directory or directly, like to see if I would be able to place a
+   file inside a directory." It becomes an extra command, so that `cd` and `ls` keep their
+   behaviour and their round trips. The server is asked (MxAc), nothing is tried. Every agent of
+   this stage runs on Opus, the planner and the fix agent included. Decided on the plan: the
+   check before a large `put` asks for attributes only (it refused a `put -f` that a small file
+   passes); `rmdir` is shown as unknown when the directory may be deleted but its parent lets
+   nothing change.

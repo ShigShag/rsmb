@@ -1252,3 +1252,48 @@ fn kerberos_connections_through_the_proxy() {
         expect_proxy_lines(kdc, k0 + kdc_more, &format!("{}: the KDC", cache.display()));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stage 6: access (docs/plans/stage-6.md 7.4)
+
+/// X81: `access` at the slow endpoint: one round trip for a path, two for `-e` of a small
+/// directory, the probes of 2,000 entries 256 wide.
+#[test]
+fn timing_access() {
+    let _s = serial();
+    let before = drops();
+    tapped_cost(&[], "access upload", 5, 20, 5);
+    let mut c = Client::direct(SLOW);
+    c.cmd("use share").expect_ok("use share");
+    let mut median = |line: &str, n: usize| -> f64 {
+        let mut v: Vec<f64> = (0..n)
+            .map(|_| {
+                let r = c.cmd(line);
+                r.expect_ok(line);
+                r.took.as_secs_f64() * 1e3
+            })
+            .collect();
+        v.sort_by(f64::total_cmp);
+        v[n / 2]
+    };
+    let one = median("access upload", 5);
+    let tree = median("access -e /tree", 5);
+    let fanout = median("access -e /fanout", 3);
+    println!(
+        "access at slow (100 ms each way): upload {one:.1} ms, -e /tree {tree:.1} ms, -e /fanout \
+         {fanout:.0} ms"
+    );
+    assert!(
+        one < 260.0,
+        "access upload: {one:.1} ms, expected under 260"
+    );
+    assert!(
+        tree < 500.0,
+        "access -e /tree: {tree:.1} ms, expected under 500"
+    );
+    assert!(
+        fanout < 4000.0,
+        "access -e /fanout: {fanout:.0} ms, expected under 4 s"
+    );
+    assert_eq!(drops(), before, "netem dropped packets during the timing");
+}

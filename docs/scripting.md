@@ -78,6 +78,7 @@ that prints a name to a terminal must filter it itself; a name from `--json` can
 | `denied` | `path`: a directory of a walk whose listing the server refused; what is in it is unknown | `tree`, `find`, after the entries |
 | `skipped` | `path`, `reason` (`already_listed`: a directory with its file id was listed already, a link back to the start or a second path to one directory; `outside`: it leads to the start's parent directory, which the walk does not list; `gone`: it vanished between its parent's listing and its own; `no_file_id`: the server gives no file ids and the walk is at its limit), `same_as` (for `already_listed` the path under which that directory was listed, else `null`; never a path the walk did not list) | `tree`, `find`, after the `denied` objects |
 | `walk_summary` | `command` (`tree` or `find`), `path` (the start), `directories` (listings that succeeded, the start included), `entries` (every entry those listings held), `matched` (the `entry` objects printed), `denied`, `skipped`, `failed` (integers), `seconds` | `tree`, `find`: once, **only after a walk that ran to its end** |
+| `access` | `name` (`""` for the share root), `path` (from the share root, starting with `/`), `is_dir`, `mask` (integer: the MaximalAccess the server computed for this login, or `null`), `attributes` (integer: the file attributes of the server's answer, 16 directory, 1 read-only; or `null`), `error` (an error kind when this entry of `access -e` could not be asked about, else `null`); a directory has `ls`, `put` (a new file into it), `mkdir`, `rmdir`, a file `get`, `replace` (`put -f` over it), `rm`, each `true` (allowed), `false` (refused) or `null` (unknown), never the other type's keys | `access`: one per path, all after the last answer |
 | `pwd` | `host`, `share` (or `null`), `path` (`/` or `/a/b`) | `pwd` |
 | `error` | `kind`, `message`, `command` (or `null` at start-up); `path` (string: only for an error about one item of a recursive transfer, the remote path for `get`, the local path for `put`); `left_behind` (array of strings: only when temporary files could not be removed, and only on the error of the command that left them, never again on a later one; remote ones as `/dir/.rsmb-….part` on the selected share, local ones as absolute paths). Each extra field is present only when it has something to say | any failure |
 | `transfer` | `direction` (`get` or `put`), `remote` (from the share root, starting with `/`), `local` (absolute path), `bytes` (integer), `seconds` (number) | `get`, `put`: one per file that arrived, written as it arrives |
@@ -118,6 +119,16 @@ lines is **the same on every run**: breadth first, the start's entries, then the
 each of its directories in name order, and so on; a directory's own line before what is in it.
 `tree`'s order is the drawing's: depth first, by name.
 
+**Asking before acting** (`access`). A column says what the server would allow at that moment,
+for this login: a directory's `put` means "a new file into it", a file's `replace` means "`put -f`
+over it". `null` means rsmb cannot tell, which a script treats as "try it". Act and check the exit
+code all the same: the answer is not a lock, and `known-limitations.md` names the cases where it
+and the command differ (a drop box whose inherited permissions keep you from renaming your own new
+file says `put: true`, and `put` then fails with `access_denied` and `left_behind`). A path that
+cannot be asked about is the command's error when it is given alone (exit 1, an `error` object),
+and an `access` object with `error` set as an entry of `access -e` (exit 0). A large `access -e`
+prints nothing until it has every answer (`/huge`, 100,000 entries: about 22 s on a fast link).
+
 Example lines (from the test server):
 
 ```
@@ -136,6 +147,9 @@ Example lines (from the test server):
 {"bytes":5,"direction":"get","directories":1,"failed":2,"files":1,"seconds":0.007,"type":"summary"}
 {"command":"get -r /loops","kind":"other","message":"get -r /loops: 2 of 3 not transferred","type":"error"}
 {"path":"/tree/d0/file.txt","size":8,"text":"tree/d0\n","type":"content"}
+{"attributes":16,"error":null,"is_dir":true,"ls":true,"mask":2032127,"mkdir":true,"name":"upload","path":"/upload","put":true,"rmdir":null,"type":"access"}
+{"attributes":128,"error":null,"get":true,"is_dir":false,"mask":1507743,"name":"mine.txt","path":"/upload/s/mine.txt","replace":true,"rm":true,"type":"access"}
+{"attributes":null,"error":"other","get":null,"is_dir":false,"mask":null,"name":"b.fifo","path":"/upload/s/b.fifo","replace":null,"rm":null,"type":"access"}
 {"depth":1,"file_id":"68435286","is_dir":true,"mtime":"2026-11-18T10:31:12Z","name":"self","path":"/loops/self","size":0,"type":"entry"}
 {"path":"/tree/forbidden","type":"denied"}
 {"path":"/loops/self","reason":"already_listed","same_as":"/loops","type":"skipped"}
@@ -262,6 +276,23 @@ Quoting: the pattern goes through the shell and then through rsmb's tokeniser; `
 '*.txt'"` hands rsmb `find -name '*.txt'`, which rsmb takes as the pattern `*.txt` (it does no
 globbing, so `*.txt` unquoted works inside rsmb too). A path with a `'` in it needs the
 tokeniser's own quoting (`it\'s.txt`).
+
+bash, may I put a file into /upload, and what may I change in /tree (output from the test
+server; `/tree` belongs to root, so nothing in it may be changed):
+
+```bash
+rsmb -H 10.213.45.10 -u tester -p testpass -d TESTDOM --json -N \
+     -C 'use share' -C 'access /upload' -C 'access -e /tree' |
+  jq -c 'select(.type == "access") | if .is_dir then {path, put} else {path, replace, rm} end'
+# {"path":"/upload","put":true}
+# {"path":"/tree/d0","put":false}
+# {"path":"/tree/d1","put":false}
+# {"path":"/tree/d2","put":false}
+# {"path":"/tree/d3","put":false}
+# {"path":"/tree/forbidden","put":false}
+# {"path":"/tree/unreadable.txt","replace":false,"rm":false}
+# a value null means rsmb cannot tell: try it and check the exit code
+```
 
 bash, upload a directory and check the summary:
 

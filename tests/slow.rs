@@ -2146,3 +2146,158 @@ fn kerberos_failures() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stage 6: access, and the check of a large put (docs/plans/stage-6.md 7.4)
+
+/// S85: a large `put -f` over a file that cannot be replaced (root's 0600 file in root's sticky
+/// directory) is refused by the rename after the upload, not by the check before it (A14: the
+/// check opens it for its attributes now); nothing is left behind, the target is untouched.
+#[test]
+fn put_f_refused_by_the_rename() {
+    let dir = tmp("put_f_refused_by_the_rename");
+    make_file(&dir.join("big.bin"), 300_000, 85);
+    let s = Scratch::new(Ep::Slow);
+    docker_sh(
+        s.container,
+        &format!(
+            "cd {} && mkdir sticky && chmod 1777 sticky && head -c 300000 /dev/zero > \
+             sticky/root.bin && chmod 0600 sticky/root.bin",
+            sq(&s.server())
+        ),
+    );
+    let target = format!("{}/sticky/root.bin", s.server());
+    let old = server_sha(s.container, &target);
+    let mut c = ready(Client::tapped(Ep::Slow), &dir, Some(&s.remote()));
+    let r = c.cmd_within("put -f big.bin sticky/root.bin", WAIT);
+    assert_eq!(r.kind().as_deref(), Some("access_denied"), "{:?}", r.lines);
+    let m = r.of("error")[0]["message"].as_str().unwrap().to_string();
+    assert!(m.contains("refused to replace it"), "{m}");
+    assert!(
+        count(r.stats(), "WRITE") >= 1,
+        "the data went out before the rename\n{}",
+        context(r.stats())
+    );
+    assert_eq!(server_sha(s.container, &target), old, "target untouched");
+    assert_nothing_left(&s, &dir, None, None);
+}
+
+/// S81: the counts at the slow endpoint; `-e /fanout` with 256 paths in flight.
+#[test]
+fn access_slow() {
+    let mut c = Client::tapped(Ep::Slow);
+    c.cmd("use share").expect_ok("use share");
+    let r = c.cmd("access upload");
+    r.expect_ok("access upload");
+    r.expect("access upload at slow", 4, 1);
+    let r = c.cmd("access -e /tree");
+    r.expect_ok("access -e /tree");
+    r.expect("access -e /tree at slow", 19, 2);
+    let r = c.cmd_within("access -e /fanout", NO_HANG);
+    r.expect_ok("access -e /fanout");
+    let objs = r.of("access");
+    assert_eq!(objs.len(), 2000);
+    assert!(
+        objs.iter().all(|v| v["mask"].is_u64()),
+        "every entry a mask"
+    );
+    assert_eq!(
+        r.stats().requests,
+        4007,
+        "5 + 2 x 2,001\n{:?}",
+        r.stats().per_command
+    );
+    println!("access -e /fanout at slow: {:?}", r.took);
+}
+
+/// S82: on the server with 16 credits: 8 paths per compound, one compound at a time, and never a
+/// credit spent that was not granted.
+#[test]
+fn access_edge() {
+    let mut c = Client::tapped(Ep::Edge);
+    let mut parts = vec![c.startup.stats().clone()];
+    let r = c.cmd("use share");
+    r.expect_ok("use share");
+    parts.push(r.stats().clone());
+    let r = c.cmd("ls /fanout");
+    r.expect_ok("ls /fanout on edge");
+    let listing = r.stats().requests;
+    parts.push(r.stats().clone());
+    let r = c.cmd_within("access -e /fanout", Duration::from_secs(30));
+    r.expect_ok("access -e /fanout on edge");
+    let objs = r.of("access");
+    assert_eq!(objs.len(), 2000);
+    assert!(
+        objs.iter().all(|v| v["mask"].is_u64()),
+        "every entry a mask"
+    );
+    assert_eq!(
+        r.stats().requests,
+        listing + 4002,
+        "the listing as ls ({listing}) + 2 x 2,001\n{:?}",
+        r.stats().per_command
+    );
+    assert!(r.took < Duration::from_secs(30), "took {:?}", r.took);
+    parts.push(r.stats().clone());
+    let refs: Vec<&smbtap::Stats> = parts.iter().collect();
+    let (low, peak) = credit_balance(&refs);
+    println!(
+        "access -e /fanout on edge: {:?}, lowest credit balance {low}, peak outstanding {peak}",
+        r.took
+    );
+    assert!(
+        low >= 0,
+        "a credit spent that was not granted (balance {low})"
+    );
+}
+
+/// S83: a connection closed in the middle of `access -e /many`: every pending probe fails at
+/// once and the command runs again from its listing on a new connection, printing each path once.
+#[test]
+fn cut_mid_access() {
+    let mut c = Client::tapped(Ep::Slow);
+    c.cmd("use share").expect_ok("use share");
+    c.send("access -e /many");
+    c.wait_requests("CREATE", 40, WAIT);
+    c.tap().drop_connections();
+    let r = c.wait_done(WAIT);
+    r.expect_ok("access -e /many across a cut");
+    let objs = r.of("access");
+    assert_eq!(objs.len(), 10_000);
+    let paths: std::collections::BTreeSet<&str> =
+        objs.iter().map(|v| v["path"].as_str().unwrap()).collect();
+    assert_eq!(paths.len(), 10_000, "each path once");
+    let s = r.stats();
+    assert_eq!(s.connections, 1, "exactly 1 new connection\n{}", log(s));
+    let conns: std::collections::BTreeSet<u64> = s.request_log.iter().map(|q| q.conn).collect();
+    assert_eq!(conns.len(), 2, "requests on two connections");
+    for conn in conns {
+        assert!(
+            s.request_log
+                .iter()
+                .any(|q| q.conn == conn && q.command == "QUERY_DIRECTORY"),
+            "the listing on connection {conn}: it ran again from its start"
+        );
+    }
+}
+
+/// S84: an interrupt in the middle of `access -e /many` (SIGINT, then SIGTERM).
+#[test]
+fn interrupt_mid_access() {
+    for signal in ["-INT", "-TERM"] {
+        let mut c = Client::tapped(Ep::Slow);
+        c.cmd("use share").expect_ok("use share");
+        c.send("access -e /many");
+        c.wait_requests("CREATE", 40, WAIT);
+        let t0 = std::time::Instant::now();
+        c.kill(&signal[1..]);
+        let (code, rest) = c.wait_exit(NO_HANG);
+        assert_eq!(code, 130, "{signal}: {rest:?}");
+        assert!(t0.elapsed() < NO_HANG, "{signal}: took {:?}", t0.elapsed());
+        let e = rest
+            .iter()
+            .find(|v| v["type"] == "error")
+            .unwrap_or_else(|| panic!("{signal}: no error: {rest:?}"));
+        assert_eq!(e["kind"], "interrupted", "{signal}");
+    }
+}

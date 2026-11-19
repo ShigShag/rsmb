@@ -4,7 +4,7 @@
 //! reconnect, and the mapping of the crate's errors to ours. All use of `smb2` is in this file.
 //! docs/architecture.md describes the design.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,7 @@ use smb2::msg::close::CloseRequest;
 use smb2::msg::create::{
     CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
+use smb2::msg::create_context::{self, CreateContext, pack_contexts, parse_contexts};
 use smb2::msg::query_directory::{
     FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest,
 };
@@ -2129,9 +2130,8 @@ pub fn crate_path(components: &[String]) -> Result<String> {
     Ok(components.join("/"))
 }
 
-/// CREATE + CLOSE in one compound: 2 requests, 1 flight. The CREATE's answer decides. Used by
-/// `cd` (open a directory), the existence check (open anything) and `mkdir` (create, or
-/// open-or-create, a directory).
+/// CREATE + CLOSE in one compound with `cd`'s access: 2 requests, 1 flight. The CREATE's answer
+/// decides. Used by `cd` (open a directory) and `mkdir` (create, or open-or-create, a directory).
 async fn open_close(
     conn: &Connection,
     tree: &Tree,
@@ -2170,6 +2170,144 @@ async fn create_close(
         .map_err(|e| classify(e, what))?;
     let f = ok_frame(answers.into_iter().next().ok_or_else(malformed)?, what)?;
     CreateResponse::unpack(&mut ReadCursor::new(&f.body)).map_err(|_| malformed())
+}
+
+// ---------------------------------------------------------------------------------------------
+// access: the server's maximal access to a path (MxAc)
+
+/// What the server says this session may do with one path: the MxAc answer of a CREATE
+/// (MS-SMB2 2.2.13.2.5, 2.2.14.2.5). Nothing is created or changed to find out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rights {
+    pub is_dir: bool,
+    /// FileAttributes of the CREATE answer (0x10 directory, 0x1 read-only, …).
+    pub attributes: u32,
+    /// MaximalAccess; None when the answer had no MxAc context, a short one, or a QueryStatus
+    /// that is not success.
+    pub mask: Option<u32>,
+}
+
+/// The create context's name.
+const MXAC: &[u8] = b"MxAc";
+/// Paths asked about at once, at most (512 requests): where 200 ms stop dominating (Stage 6
+/// plan 2.9).
+const PROBE_LIMIT: usize = 256;
+
+/// CREATE (open only, file or directory, FILE_READ_ATTRIBUTES: the one access every reachable
+/// object grants, so the answer never hides the mask) with an empty MxAc context.
+fn rights_request(name: String) -> CreateRequest {
+    let mut c = open_request(name, FileAccessMask::FILE_READ_ATTRIBUTES);
+    c.create_options = 0;
+    c.create_contexts = pack_contexts(&[CreateContext::new(MXAC, Vec::new())]);
+    c
+}
+
+/// MaximalAccess from a CREATE answer's context chain; None when it is not there or not usable
+/// (a malformed chain included: the open itself succeeded).
+fn maximal_access(contexts: &[u8]) -> Option<u32> {
+    let cs = parse_contexts(contexts).ok()?;
+    let d = &create_context::find(&cs, MXAC)?.data;
+    (d.len() >= 8 && u32_at(d, 0) == 0).then(|| u32_at(d, 4))
+}
+
+/// How many answers of a chain count, from (CREATE succeeded, CLOSE succeeded) per path: up to
+/// the first failed CREATE, which counts itself only when it is the first or the CLOSE before it
+/// succeeded (otherwise its status may be the CLOSE's, passed on). The server fails every later
+/// request of a related chain with the status of the first failure (Stage 6 plan 2.8, A5).
+fn answered(pairs: &[(bool, bool)]) -> usize {
+    match pairs.iter().position(|&(create, _)| !create) {
+        None => pairs.len(),
+        Some(0) => 1,
+        Some(i) if pairs[i - 1].1 => i + 1,
+        Some(i) => i,
+    }
+}
+
+/// Puts the answered results of the chain `group` (indices into the call's paths) in their
+/// places and queues every later index of the chain again, each alone, in the chain's order,
+/// behind what was queued before.
+fn settle(
+    group: &[usize],
+    answers: Vec<Result<Rights>>,
+    results: &mut [Option<Result<Rights>>],
+    queue: &mut VecDeque<Vec<usize>>,
+) {
+    let n = answers.len();
+    for (&i, a) in group.iter().zip(answers) {
+        results[i] = Some(a);
+    }
+    for &i in group.iter().skip(n) {
+        queue.push_back(vec![i]);
+    }
+}
+
+/// One chain: CREATE (with MxAc) + CLOSE per path, all in one compound (2 requests per path,
+/// 1 flight). Returns the results of the first `answered` paths, in order; the caller asks again
+/// for the rest. A lost connection is the call's error. An error of the call itself that is not a
+/// lost connection means the compound never reached the wire: every path gets it (A19).
+async fn probe_rights(
+    conn: &Connection,
+    tree: &Tree,
+    paths: &[Vec<String>],
+) -> Result<Vec<Result<Rights>>> {
+    let creates: Vec<CreateRequest> = paths
+        .iter()
+        .map(|p| rights_request(tree_path(tree, p)))
+        .collect();
+    let close = CloseRequest {
+        flags: 0,
+        file_id: FileId::SENTINEL,
+    };
+    let tid = Some(tree.tree_id);
+    let mut ops = Vec::with_capacity(2 * creates.len());
+    for c in &creates {
+        ops.push(CompoundOp::new(Command::Create, c, tid));
+        ops.push(CompoundOp::new(Command::Close, &close, tid));
+    }
+    let answers = match conn.execute_compound(&ops).await {
+        Ok(a) => a,
+        Err(e) => {
+            let e = classify(e, "access");
+            if e.is_lost() {
+                return Err(e);
+            }
+            let each = |p: &Vec<String>| {
+                Err(Error::new(
+                    e.kind,
+                    format!("{}: {}", display_path(p), e.message),
+                ))
+            };
+            return Ok(paths.iter().map(each).collect());
+        }
+    };
+    let mut answers = answers.into_iter();
+    let mut pairs = Vec::with_capacity(paths.len());
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let what = display_path(p);
+        let create = match answers.next() {
+            Some(a) => ok_frame(a, &what),
+            None => Err(Error::other(format!("{what}: no answer from the server"))),
+        };
+        if let Err(e) = &create
+            && e.is_lost()
+        {
+            return Err(e.clone());
+        }
+        let closed = matches!(answers.next(), Some(Ok(f)) if f.header.status == NtStatus::SUCCESS);
+        pairs.push((create.is_ok(), closed));
+        out.push(create.and_then(|f| {
+            let c = CreateResponse::unpack(&mut ReadCursor::new(&f.body))
+                .map_err(|_| Error::other(format!("{what}: malformed answer from the server")))?;
+            Ok(Rights {
+                is_dir: c.file_attributes & 0x10 != 0,
+                attributes: c.file_attributes,
+                mask: maximal_access(&c.create_contexts),
+            })
+        }));
+    }
+    out.truncate(answered(&pairs));
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2359,12 +2497,20 @@ impl Remote {
         Ok(l)
     }
 
-    /// 2 requests, 1 flight; None when nothing has the name.
+    /// 2 requests, 1 flight; None when nothing has the name. The open asks for
+    /// FILE_READ_ATTRIBUTES only, which Samba grants on everything that can be reached: with
+    /// `cd`'s SYNCHRONIZE a file one may replace but not read (root's 0600 in one's own
+    /// directory) was refused here, and a large `put -f` with it (docs/transfers.md, "The two
+    /// paths"; Stage 6 plan A14).
     pub async fn stat(&self, path: &[String]) -> Result<Option<Stat>> {
         crate_path(path)?;
         let what = display_path(path);
-        let open = CreateDisposition::FileOpen;
-        match open_close(&self.conn, &self.tree, path, open, 0, 0, &what).await {
+        let mut create = open_request(
+            tree_path(&self.tree, path),
+            FileAccessMask::FILE_READ_ATTRIBUTES,
+        );
+        create.create_options = 0;
+        match create_close(&self.conn, &self.tree, create, &what).await {
             Ok(c) => Ok(Some(Stat {
                 is_dir: c.file_attributes & 0x10 != 0,
                 size: c.end_of_file,
@@ -3071,6 +3217,74 @@ impl Session {
             }
         }
         Ok((out, None))
+    }
+
+    /// What this session may do with each path of the selected share, in order (`probe_rights`).
+    /// Chains of up to ACCESS_CHAIN paths, at most min(credits / 2, PROBE_LIMIT) paths in flight
+    /// (credits when the call starts, at least 1); the paths after a failure in a chain are asked
+    /// again, one per compound. A path the crate would not send as it is (`crate_path`) is
+    /// `invalid_name` and is not sent. A lost connection fails the call: nothing has been printed,
+    /// so the command may run again.
+    pub async fn rights(&mut self, paths: &[Vec<String>]) -> Result<Vec<Result<Rights>>> {
+        let share = self.selected()?;
+        self.in_flight = true;
+        let r = self.rights_inner(&share, paths).await;
+        self.in_flight = false;
+        r
+    }
+
+    async fn rights_inner(
+        &mut self,
+        share: &str,
+        paths: &[Vec<String>],
+    ) -> Result<Vec<Result<Rights>>> {
+        let tree = self.tree(share).await?;
+        let limit = (usize::from(self.conn.credits()) / 2).clamp(1, PROBE_LIMIT);
+        let per = ACCESS_CHAIN.min(limit);
+        let mut results: Vec<Option<Result<Rights>>> = vec![None; paths.len()];
+        let mut send = Vec::with_capacity(paths.len());
+        for (i, p) in paths.iter().enumerate() {
+            match crate_path(p) {
+                Ok(_) => send.push(i),
+                Err(e) => results[i] = Some(Err(e)),
+            }
+        }
+        let mut queue: VecDeque<Vec<usize>> = send.chunks(per).map(<[usize]>::to_vec).collect();
+        let mut set = JoinSet::new();
+        let mut flying = 0;
+        loop {
+            while let Some(g) = queue.front()
+                && flying + g.len() <= limit
+            {
+                let g = queue.pop_front().unwrap_or_default();
+                flying += g.len();
+                let ps: Vec<Vec<String>> = g.iter().map(|&i| paths[i].clone()).collect();
+                let (conn, tree) = (self.conn.clone(), tree.clone());
+                set.spawn(async move {
+                    let r = probe_rights(&conn, &tree, &ps).await;
+                    (g, r)
+                });
+            }
+            let Some(j) = set.join_next().await else {
+                break;
+            };
+            match j {
+                Ok((g, Ok(answers))) => {
+                    flying -= g.len();
+                    settle(&g, answers, &mut results, &mut queue);
+                }
+                Ok((_, Err(e))) => return Err(e),
+                // A task that ended without a result may have left requests on the wire (A19).
+                Err(e) => {
+                    self.mark_dead();
+                    return Err(Error::other(format!("access: a probe ended early ({e})")));
+                }
+            }
+        }
+        Ok(results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(Error::other("access: no answer"))))
+            .collect())
     }
 
     pub fn known_shares(&self) -> Option<Arc<Vec<Share>>> {
@@ -5162,5 +5376,109 @@ THIRD.TEST = {
                 "{etype:?}"
             );
         }
+    }
+
+    fn mxac(status: u32, mask: u32) -> CreateContext {
+        let mut d = status.to_le_bytes().to_vec();
+        d.extend_from_slice(&mask.to_le_bytes());
+        CreateContext::new(MXAC, d)
+    }
+
+    #[test]
+    fn maximal_access_answers() {
+        let qfid = CreateContext::new(b"QFid", vec![7; 32]);
+        let one = |c: &[CreateContext]| maximal_access(&pack_contexts(c));
+        assert_eq!(one(&[mxac(0, 0x001f_01ff)]), Some(0x001f_01ff));
+        assert_eq!(one(&[mxac(0xC000_0022, 0x001f_01ff)]), None, "QueryStatus");
+        assert_eq!(
+            one(&[CreateContext::new(MXAC, vec![0; 4])]),
+            None,
+            "4 bytes"
+        );
+        assert_eq!(one(std::slice::from_ref(&qfid)), None, "no MxAc");
+        assert_eq!(
+            one(&[qfid.clone(), mxac(0, 0x80)]),
+            Some(0x80),
+            "after QFid"
+        );
+        assert_eq!(maximal_access(&[]), None, "empty");
+        let mut bad = pack_contexts(&[qfid, mxac(0, 0x80)]);
+        bad[0..4].copy_from_slice(&4096u32.to_le_bytes());
+        assert_eq!(maximal_access(&bad), None, "Next past the end");
+    }
+
+    #[test]
+    fn rights_request_shape() {
+        use smb2::pack::{Pack, WriteCursor};
+        let c = rights_request("a\\b".into());
+        assert_eq!(c.desired_access.bits(), 0x80, "FILE_READ_ATTRIBUTES only");
+        assert!(matches!(c.create_disposition, CreateDisposition::FileOpen));
+        assert_eq!(c.create_options, 0, "a file or a directory");
+        assert_eq!(c.share_access.0, 7);
+        assert!(matches!(c.requested_oplock_level, OplockLevel::None));
+        assert_eq!(c.name, "a\\b");
+        let cs = parse_contexts(&c.create_contexts).unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].name, b"MxAc");
+        assert!(cs[0].data.is_empty());
+        let mut w = WriteCursor::new();
+        c.pack(&mut w);
+        let body = w.into_inner();
+        assert_ne!(u32_at(&body, 48), 0, "CreateContextsOffset");
+        assert_ne!(u32_at(&body, 52), 0, "CreateContextsLength");
+    }
+
+    #[test]
+    fn chain_answers_up_to_the_first_failure() {
+        let (t, f) = (true, false);
+        assert_eq!(answered(&[]), 0);
+        assert_eq!(answered(&[(t, t), (t, t)]), 2);
+        assert_eq!(answered(&[(t, t), (f, f), (t, t)]), 2);
+        assert_eq!(answered(&[(f, f), (t, t)]), 1);
+        assert_eq!(answered(&[(t, t), (t, t), (f, f)]), 3);
+        assert_eq!(
+            answered(&[(t, f), (f, f)]),
+            1,
+            "the second CREATE's failure may be the CLOSE's"
+        );
+        assert_eq!(answered(&[(t, f), (t, t)]), 2);
+    }
+
+    #[test]
+    fn chain_retries_keep_their_places() {
+        let ok = |a: u32| -> Result<Rights> {
+            Ok(Rights {
+                is_dir: false,
+                attributes: a,
+                mask: Some(a),
+            })
+        };
+        let mut results: Vec<Option<Result<Rights>>> = vec![None; 8];
+        let mut queue: VecDeque<Vec<usize>> = VecDeque::from([vec![7]]);
+        settle(&[3, 4, 5, 6], vec![ok(3), ok(4)], &mut results, &mut queue);
+        let set: Vec<usize> = (0..8).filter(|&i| results[i].is_some()).collect();
+        assert_eq!(set, [3, 4], "nothing else touched");
+        assert_eq!(results[3].clone().unwrap().unwrap(), ok(3).unwrap());
+        assert_eq!(results[4].clone().unwrap().unwrap(), ok(4).unwrap());
+        assert_eq!(
+            queue,
+            [vec![7], vec![5], vec![6]],
+            "behind what was queued, in order"
+        );
+        queue.pop_front();
+        queue.pop_front();
+        settle(&[5], vec![ok(5)], &mut results, &mut queue);
+        let gone = Err(Error::new(Kind::NotFound, "/x: not found"));
+        queue.pop_front();
+        settle(&[6], vec![gone], &mut results, &mut queue);
+        assert_eq!(results[5].clone().unwrap().unwrap(), ok(5).unwrap());
+        assert_eq!(
+            results[6].clone().unwrap().unwrap_err().kind,
+            Kind::NotFound
+        );
+        assert!(
+            queue.is_empty(),
+            "a group of one with a failure queues nothing"
+        );
     }
 }

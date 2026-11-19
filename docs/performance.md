@@ -65,8 +65,11 @@ Samba 4.23.8; slow = 100 ms each way (200 ms round trip), fast = direct. Measure
 | walk on 16 credits (3.4) | `fanout/` within 60 s, never a credit not granted | 0.79 s, 8,011 requests, peak outstanding 16, lowest balance 0 | `walk_edge` |
 | a walk's memory | `find /huge`, `tree /huge` peak RSS ≤ 64 MB | 28.7 MB and 25.1 MB for the whole process | `walk_counts_fast` |
 | a closed stdout stops `find` | ≤ 200 requests after the reader left | 0 (8 in all, exit 1 after 2.1 s) | `find_and_a_closed_pipe` |
-| everything through the SOCKS5 proxy (4.1) | the same requests and flights as direct, every count assertion of `tests/fast.rs` | all 69 tests of `tests/fast.rs` pass through port 1080 with their counts unchanged; 33 commands counted equal while planning | the proxied run of `tests/fast`, `one_connection_through_the_proxy` |
+| everything through the SOCKS5 proxy (4.1) | the same requests and flights as direct, every count assertion of `tests/fast.rs` | all 86 tests of `tests/fast.rs` pass through port 1080 with their counts unchanged; 33 commands counted equal while planning | the proxied run of `tests/fast`, `one_connection_through_the_proxy` |
 | one connection through the proxy (4.3) | 1 in the tap, 1 on the private server, 1 proxy log line per session | 1, 1, 1 on both ports; a reconnect 1 more of each | `one_connection_through_the_proxy` |
+| `access` (Stage 6) | a path and its directory in one compound; `-e` the listing then 16 paths per compound, 256 in flight | `access upload` 4 / 1, at the root 2 / 1, `-e /tree` 19 / 2, `-e /` 43 in 2 or 3 flights, `-e /fanout` 4,007 at slow; `cd` and `ls` unchanged (2 / 1, 5 / 1) | `access_costs`, `access_slow` |
+| `access` wall time, slow (Stage 6) | `access upload` < 260 ms, `-e /tree` < 500 ms, `-e /fanout` < 4 s | 201.6 ms, 404.5 ms, 1,921 ms (medians of 5, 5 and 3, 2026-11-19) | `timing_access` |
+| `access -e` on 16 credits (Stage 6) | `fanout/` within 30 s, never a credit not granted | 0.92 s, the listing + 4,002 requests, peak outstanding 16, lowest balance 0 | `access_edge` |
 | a 1.1 GiB file through the proxy (4.8) | sha256 equal, ≤ 16 outstanding, peak RSS ≤ 64 MB, 0 new connections | 1.41 s down, 1.69 s up at fast; 12.8 / 13.7 MB | `big_file_through_the_proxy` |
 
 ## Navigation against smbclient-ng
@@ -395,6 +398,41 @@ the control, direct to the same name, saw 18, 8 of them the A and AAAA queries f
 `fileserver.rsmb.test` and their answers. A recorded measurement, not a test (a resolver cache or
 encrypted DNS would blind it); the gate's proof is `no_way_around_the_proxy`.
 
+## `access` (Stage 6)
+
+What `access` costs (`docs/plans/stage-6.md` 2.8, 2.9; the counts asserted by `access_costs`,
+`access_slow`, `access_edge`; the times of the probes alone measured while planning with a probe
+program on the same transport, 2026-11-19):
+
+| What | fast | slow (100 ms each way) | proxy → `samba` (tapped) | proxy → `wan` |
+|---|---|---|---|---|
+| a path and its directory, one compound | 4 / 1, 0.8 ms | 202 ms | 4 / 1, 0.9 ms | 202 ms |
+| `tree` and its 6 entries plus a missing name (a failure in the chain) | 20 / 2, 4.8 ms | 406 ms | 20 / 2, 45 ms | 608 ms |
+| `fanout/` 2,000 entries, 16 per compound, 256 in flight | 4,000 requests, 441 ms | 2,091 ms | 4,000, 412 ms | 2,437 ms |
+| the same, one path per compound, 256 in flight | 4,000, 444 ms | 2,254 ms | | 2,412 ms |
+| the same, one path per compound, 16 in flight | 4,000, 474 ms | 25,453 ms | | |
+| `many/` 10,000 entries | 20,000, 2,200 ms | 8,494 ms | | |
+| `huge/` 100,000 entries | 200,000, 20,879 ms | not run (about 80 s computed: 391 waves of 256 at 200 ms) | | |
+| `samba-edge` (16 credits) `fanout/`: 8 per compound, 1 in flight | 4,000, 508 ms, peak 16 outstanding | not run (about 50 s computed) | | |
+
+The listing of `-e` comes on top (5 requests, 1 round trip, as `ls`). The server's time per probe
+is about 0.21 ms, so a large directory is bounded by the server on the fast link and by the width
+at 200 ms; 256 paths in flight (512 requests) is where the slow link stops being the limit. The
+product, measured by `timing_access` at the slow endpoint: `access upload` 201.6 ms, `access -e
+/tree` 404.5 ms (2 round trips), `access -e /fanout` 1,921 ms with its listing (2026-11-19);
+`access -e /huge` at the fast endpoint, rsmb's process time (`-N --json -C 'use share' -C 'access
+-e /huge'`, the listing included): 22,165 and 22,497 ms at a load of about 1, 21,496 and 23,918
+ms at a load of about 10 (the review, 2026-11-19), against 20,879 ms for the probes alone. The
+80 s at 100 ms each way is computed for the probes alone and was not run.
+
+**Why one compound for the path and its directory.** Through microsocks two compounds sent
+together cost a second round trip: at the slow endpoint one compound took 201.9 to 202.9 ms in
+every round, two compounds either about 243 ms or about 403 ms (bimodal: 2 or 3 of 7 rounds near
+243 ms, the rest near 403 ms, three runs of 7); five independent compounds 204 ms direct, 405 ms
+through the proxy. microsocks does not set `TCP_NODELAY` on its socket to the server, so the
+second small write waits for the first's acknowledgement (the same effect as for walks and small
+files, "Through a SOCKS5 proxy" above).
+
 ## Other costs
 
 | What | Cost |
@@ -445,7 +483,8 @@ Deliberately not built, each with what it would cost:
 - A compounded share list (the 7 requests of `shares` could be fewer); the list is kept after the
   first call.
 - Per-directory access in `shares` or `ls`: a listing carries no rights, so it would cost an open
-  per directory; the access column is per share only.
+  per directory; the access column is per share only. The separate command `access` (Stage 6)
+  asks per path instead, at its own cost (above), and leaves `cd` and `ls` as they were.
 - No measurement against a real WAN or VPN; netem is a clean model (`docs/known-limitations.md`).
 - No latency between client and proxy, and no proxy other than microsocks; no `proxy` bench mode
   (it would time microsocks, and smbclient-ng has no proxied column).

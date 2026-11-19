@@ -50,10 +50,26 @@ step "test environment up"
 ./testenv/up.sh
 
 step "stale test directories"
+# On the DC each one goes through Samba first (as the administrator: clear R, S and H, then
+# deltree), so that no DOS attribute or NT ACL outlives its object in xattr.tdb by inode; rm -rf
+# then takes what is left (docs/test-environment.md, 'How the DC keeps DOS attributes').
+dc_cleanup=$(cat <<'SH'
+cd /srv/share/upload || exit 0
+for t in rsmb-test-*; do
+    [ -d "$t" ] || continue
+    c=$(cd "$t" && find . -mindepth 1 | sed 's|^\./||; s|.*|setmode "&" -rsh;|' | tr '\n' ' ')
+    smbclient //127.0.0.1/share -U 'RSMB\Administrator%Adm1n-testpass' \
+        -c "cd upload; setmode $t -rsh; cd $t; $c cd ..; deltree $t" >/dev/null \
+        || echo "test.sh: upload/$t on the DC could not be removed through Samba" >&2
+done
+rm -rf /srv/share/upload/rsmb-test-*
+SH
+)
 # Exclusive: a test that holds the shared lock may be writing to one of these directories.
-locked -x bash -c 'for c in rsmb-samba rsmb-samba-edge rsmb-samba-private rsmb-samba-dc; do
+locked -x bash -c 'for c in rsmb-samba rsmb-samba-edge rsmb-samba-private; do
     docker exec "$c" sh -c "rm -rf /srv/share/upload/rsmb-test-*"
-done'
+done
+docker exec -i rsmb-samba-dc sh -s <<<"$1"' _ "$dc_cleanup"
 
 
 step "test environment check"

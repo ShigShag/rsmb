@@ -264,3 +264,43 @@ and without the proxy. smbclient-ng worked against the same server.
 - The gate's Kerberos tests pass with the service ticket rsmb now obtains: F71, F72 (with `-f` and
   with the `-F` refusal), X71, X72, S71 and `no_way_around_the_proxy`, direct and through the
   proxy.
+
+## Stage 6 (2026-11-19)
+
+The review of `access` (what may I do here, without trying) and of A14 (`Remote::stat` asking for
+`FILE_READ_ATTRIBUTES` only). Six findings; the orchestrating session confirmed all six, finding 1
+by reproducing it on the DC, the others in the code and the documents.
+
+| # | Severity | Finding | How validated | What was done | Guarding test |
+|---|---|---|---|---|---|
+| 1 | medium | On the DC a directory's DOS record (`user.DOSATTRIB` in `xattr.tdb`, keyed by inode) outlives a removal outside Samba, and the next object made outside Samba on that inode lists as a directory. `Scratch`'s `Drop` (`setmode -rsh`, then `rm -rf`) does not prevent it: `setmode` never clears the directory bit. F82's `mkdir C/new` makes such a directory every run. The reviewer counted 14 stale records with the directory bit and showed that a directory removed over SMB leaves none | The orchestrator, as `RSMB\Administrator` on the DC: `mkdir n1 n2 n3` and `setmode -rsh` over SMB, `rmdir` outside Samba, eight files `f1`–`f8` outside Samba: `f3`, `f4`, `f5` took the inodes 18891526, 18891558, 18891628 and listed `D 0`; `setmode f3 -rsh` left `attributes: D (10)`; `deltree` of the parent then failed with `NT_STATUS_NOT_A_DIRECTORY listing …\f3\*`. The fix agent, before the fix: F82 with the new check in `nt_fixture` failed on `D/file.txt` listing `D` | `Scratch`'s `Drop` on the DC removes its directory through Samba (one `smbclient` call as the administrator: `setmode -rsh` on the directory and everything in it, because `deltree` refuses an `R` object with `NT_STATUS_CANNOT_DELETE`; then `deltree`) before `rm -rf`; `./test.sh`'s stale-directory step does the same for every `upload/rsmb-test-*` on the DC. `nt_fixture` lists its 22 objects over SMB and fails with the path and the way to recreate the DC when one lists as other than it is. `Scratch::new` on the DC checks that its directory lists as `D (10)` with the ACL Samba derives from mode 1777, and otherwise removes it with `rmdir` over SMB and makes it again (for the NT-ACL-only records a rename with replace leaves: F82 replaces `E/file.txt` and `F/file.txt`, two per run). The DC container was recreated (its state is in the container, no volume). Records whose device and inode no file has, counted with python `tdb` in the container: **before 293 on the share's device, 83 with a DOS attribute, 16 with the directory bit; after recreating 0**; after `./test.sh fast` and two more runs of F81–F87 each way 8, all NT-ACL-only from F82's two replacements, none with a DOS attribute. `docs/test-environment.md`, `docs/testing.md`, `docs/development.md`, `AGENTS.md`'s index and `docs/plans/stage-6.md` W11 say it | `access_predicts_nt_acls` (`nt_fixture`'s check failed on the old DC; a file's record planted with `tdb` on the inode the next directory takes: `Scratch::new` printed `made again` and F82 passed) |
+| 2 | low (docs) | The principle "Ask the server for its verdict…" in `AGENTS.md` cited `access_predicts_nt_acls` for the `read only` share, the sticky bit and the DOS attribute, which are not in that test (F83, F81); the sticky bit and the DOS attribute are where it disagrees (K3, K1); "K1 to K7" included K5 (no longer a disagreement under A7) and K6 (fixed by A14); K4 and K7 are not the server's command contradicting its answer | Read `NT_ROWS`/`NT_MASKS` in `tests/fast.rs` and the K table of `docs/plans/stage-6.md` 2.7 | Rewritten: each claim cites its test (F82 for NT ACLs and the group ACE of `G`, F81 for Unix modes, F83 for the `read only` share); the five remaining disagreements K1, K2, K3, K4, K7 with their causes (Samba's rename with replace checks neither the DOS read-only attribute nor DELETE on the target; the sticky bit is in no mask; rsmb asks for SYNCHRONIZE; a drop box's inheritable ACL is not in the directory's mask); K6 fixed by A14 | the text |
+| 3 | low (docs) | `access -e /huge`'s time was the planning probe's 20.9 s (the probes alone), given as the command's in `docs/commands.md`, `docs/scripting.md`, `docs/known-limitations.md`, `docs/testing.md` and the help ("about 20 s") | The orchestrator through rsmb, process time of `-N --json -C 'use share' -C 'access -e /huge'` at the fast endpoint, load about 1: 22,165 and 22,497 ms; the reviewer 21,496 and 23,918 ms at load about 10 | About 22 s everywhere, the measured values in `docs/commands.md` and `docs/performance.md`, 20.9 s kept only as "the probes alone"; the 80 s at 100 ms each way labelled as computed for the probes alone (`docs/plans/stage-6.md` W12) | none (a time outside the gate, 7.5) |
+| 4 | low (docs) | The help said `put` and `mkdir` are `?` in a directory with the DOS read-only attribute; under A7 `put` over a file in it (JSON `replace`) is `?` too | `allowed`'s file branch in `src/commands.rs` and `rights_from_masks` ("rodos/f.txt") | The help adds "and so is put over a file in it"; `docs/commands.md` already said it | `rights_from_masks` |
+| 5 | low (docs) | `docs/performance.md` said all 69 tests of `tests/fast.rs` pass through port 1080; there are 86 | `grep -c '#\[test\]' tests/fast.rs`: 86; `./test.sh fast`: `86 passed` through the proxy | 86; no other stale count in that table | the proxied step of `./test.sh` |
+| 6 | low (docs) | `docs/scripting.md`'s `access` example used `/upload/in`, which does not exist on the test server, with invented output | Read the example; no `in` under `upload` on `samba` | Rewritten against `access /upload` and `access -e /tree`, with the output of running it on the test server | none |
+
+### Checked and not attributed to Stage 6
+
+- **W9, `completion_costs_slow` (Stage 1) fails under load.** The reviewer ran `tests/slow` with
+  and without Stage 6's slow tests: 2 of 4 failed either way, and the committed `0f7bd3f` fails
+  the same way. A load-sensitive test from before this stage (the first Tab in `huge/` runs into
+  its 5 s bound while the other slow tests share the link), not a regression of `access`.
+- **W9b, `edge_and_encrypted` (Stage 2) beside S82.** Not reproduced in 6 + 12 + 8 runs. Nothing
+  in rsmb requests an oplock (the probe and every open ask for none), so an oplock break that would
+  hold the other session's request cannot be the cause. Not attributed to Stage 6.
+
+### The gate
+
+`./test.sh` after the fixes (2026-11-19, load average about 2): every step passed up to and
+including `tests/serial`, and the last step, smbtap against tshark, failed because `dumpcap` and
+`tshark` are no longer installed on the host. The user decided to commit this stage without that
+step. `iperf3` is missing too; `check.sh`'s iperf3 check ran with the `samba` image's own `iperf3`
+put first on `PATH` from outside the repository, nothing changed on the host. Real result lines:
+`check.sh: all checks passed` (29 s; `iperf3 through wan: 24.8 Mbits/sec`); unit tests `104
+passed` and `12 passed`; `tests/fast` `86 passed; 0 failed` (14 s); through the proxy `86 passed;
+0 failed` (18 s), `the proxy logged 184 connections to fileserver.rsmb.test:445`; `tests/slow`
+`51 passed; 0 failed` (40 s; `completion_costs_slow` passed this time); `tests/serial` `28
+passed; 0 failed` (387 s). The steps that ran add up to about 500 s of the 600 s budget. To
+restore the full gate: install `iperf3` and `wireshark-cli` and give the user capture rights for
+`dumpcap` (the `wireshark` group); that needs root and is the user's to do.

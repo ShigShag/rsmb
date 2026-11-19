@@ -18,7 +18,7 @@ S21, X21 …, F41, S41, X41 …, F61, S61, X61 … and F71, S71, X71 …) refer 
 | Step | Command | Lock |
 |---|---|---|
 | test environment up | `./testenv/up.sh` | its own |
-| stale test directories | `docker exec <c> sh -c 'rm -rf /srv/share/upload/rsmb-test-*'` on the three Samba containers and the DC | exclusive |
+| stale test directories | `docker exec <c> sh -c 'rm -rf /srv/share/upload/rsmb-test-*'` on the three Samba containers; on the DC each one first through Samba as the administrator (`setmode -rsh` on everything, then `deltree`), so no record in `xattr.tdb` outlives it (`docs/test-environment.md`) | exclusive |
 | test environment check | `./testenv/check.sh` | its own, exclusive |
 | cargo fmt --check | `cargo fmt --all --check` | none |
 | cargo clippy | `cargo clippy --workspace --all-targets -- -D warnings` | none |
@@ -61,26 +61,34 @@ project runs one gate at a time (`AGENTS.md`, one agent per task).
 
 ### Step times
 
-The final gate of Stage 5 (2026-11-18), environment up (seven containers), binaries built:
-**full 477 s counted of 600** (total 480 s); `./test.sh fast` alone **62 s of 150** (total 63 s).
+Stage 6 (2026-11-19), environment up (seven containers), binaries built: `./test.sh fast`
+**77 s counted of 150** (total 79 s). **The full `./test.sh` did not run to its end on this host
+that day**: `tests/slow` failed on load-dependent tests that are not of this stage
+(`completion_costs_slow`, which the committed code of Stage 5 fails the same way; once each
+`edge_and_encrypted` and `proxy_failures`; `docs/plans/stage-6.md`, W9 and W9b), and the host no
+longer has `iperf3`, `dumpcap` and `tshark` (W8). The steps after it were run by hand, so the
+full figure is the sum of the steps: **about 506 s counted of 600** (the plan expected about
+500).
 
 | Step | Full | Fast |
 |---|---|---|
-| test environment up | 1 s (not counted) | 1 s (not counted) |
+| test environment up | 2 s (not counted) | 1 s (not counted) |
 | stale test directories | 0 s | 0 s |
-| test environment check | 31 s | 31 s |
-| cargo fmt --check, cargo clippy | 0 s | 1 s |
-| build | 2 s (not counted) | 0 s |
-| unit tests | 2 s (95 in rsmb, 12 in smbtap) | 2 s |
-| tests/fast | 13 s (78 tests) | 13 s |
-| tests/fast through the proxy | 15 s (78 tests, 165 proxy log lines) | 15 s |
-| tests/slow | 28 s (46 tests) | — |
-| tests/serial | 385 s (27 tests) | — |
-| smbtap against tshark | 3 s | — |
+| test environment check | 32 to 33 s | 32 s |
+| cargo fmt --check, cargo clippy | 0 to 1 s | 0 s |
+| build | 0 s (not counted) | 1 s |
+| unit tests | 2 to 3 s (104 in rsmb, 12 in smbtap) | 2 s |
+| tests/fast | 18 to 19 s (86 tests) | 22 s |
+| tests/fast through the proxy | 19 s (86 tests, 184 proxy log lines) | 21 s |
+| tests/slow | 43 s (51 tests; measured with `completion_costs_slow` skipped, which ends a failing run 60 s later) | — |
+| tests/serial | 387 s (28 tests) | — |
+| smbtap against tshark | not run (no `dumpcap` on the host; 3 s after Stage 5) | — |
 
-Earlier figures: full 304 s of 420 after Stage 2, 386 s of 540 after Stage 3, 445 s after Stage 4
-(the plan expected about 458 s and 64 s), 456 s after the final review of Stage 4 (fast 57 s);
-the Stage 5 plan expected about 482 s and 66 s.
+The final gate of Stage 5 (2026-11-18): full 477 s counted of 600 (check 31, unit 2, fast 13,
+proxy 15, slow 28, serial 385, tshark 3); `./test.sh fast` 62 s of 150. Earlier figures: full
+304 s of 420 after Stage 2, 386 s of 540 after Stage 3, 445 s after Stage 4 (the plan expected
+about 458 s and 64 s), 456 s after the final review of Stage 4 (fast 57 s); the Stage 5 plan
+expected about 482 s and 66 s.
 
 The integration tests run in the release profile (the wall-time and memory rows measure the
 binary that ships); the unit tests in the dev profile.
@@ -89,7 +97,7 @@ binary that ships); the unit tests in the dev profile.
 
 | Binary | What | Runs |
 |---|---|---|
-| unit tests (`src/*.rs`) | pure logic: tokeniser, quoting, paths, error mapping, listing plan, parser, cache, time format, the table and the manual, the receive half on a local socket, the walk on fake trees, the pattern matcher, sizes, the tree drawing, the end report, the ticket cache's rules, `krb5.conf`, the TGS request's checksums and times, Kerberos encryption, the KDC exchange against a fake KDC and fake proxies on local sockets | always |
+| unit tests (`src/*.rs`) | pure logic: tokeniser, quoting, paths, error mapping, listing plan, parser, cache, the rule of `access` and its MxAc codec and chain arithmetic, time format, the table and the manual, the receive half on a local socket, the walk on fake trees, the pattern matcher, sizes, the tree drawing, the end report, the ticket cache's rules, `krb5.conf`, the TGS request's checksums and times, Kerberos encryption, the KDC exchange against a fake KDC and fake proxies on local sockets | always |
 | `tests/fast.rs` | fast endpoint (10.213.45.10) and, for Kerberos, the DC (10.213.45.12), safe beside other tests; run a second time through the proxy (`RSMB_TEST_VIA=socks5`) | `fast` and full, twice each |
 | `tests/slow.rs` | slow endpoint (100 ms each way), edge, wan-bad, the proxy's failures, its login port, its cuts and signals; what proves the KDC's side of a Kerberos login (its log, its failures); each test has its own tap, so they run in parallel | full |
 | `tests/serial.rs` | anything that pauses a server (the DC included), uses the blackhole, resets or reads the server-side connection count, counts the proxy's log exactly, or asserts a wall time or a number of new connections that depends on the 2 s of a cleanup | full, one at a time |
@@ -218,6 +226,24 @@ holds a `Guard` whose `Drop` undoes it, also when the test fails.
   so a tapped direct session may be TGT-only. `Scratch::new` on the DC makes the directory with
   mode 1777 (a file written over SMB belongs to the id Samba maps the realm's user to, not to a
   Unix user); `Scratch::sh` is not used there.
+- **Stage 6: `access`.** `posix_fixture(s)` makes the POSIX fixture of `docs/plans/stage-6.md` 6.1
+  in `s` as root on its container (`docker_sh` with `cd <server path> && <script>`, not
+  `Scratch::sh`, which runs as tester); `nt_fixture(s)` the NT ACL fixture of 6.2 as root on the DC
+  (`smbcacls` as the DC's administrator). `outcomes(c, lines)` runs each line and returns, per
+  line, None or the error's kind. `access_by_name(r)`: the `access` objects of a reply by name.
+  **`Scratch` on the DC** keeps `xattr.tdb` clean, because the DC keeps DOS attributes and NT
+  ACLs by inode and an object made outside Samba on a reused inode inherits what an old one left
+  (`docs/test-environment.md`): its `Drop` removes the directory **through Samba** before `rm
+  -rf` (one `smbclient` call as the administrator: `setmode "<path>" -rsh` on the directory and
+  everything in it, then `deltree`; a failure is printed); `Scratch::new` clears the new
+  directory's flags over SMB and checks that it lists as `attributes: D (10)` with the ACL Samba
+  derives from its mode (`DC_SCRATCH_ACL`), and otherwise removes it with `rmdir` over SMB and
+  makes it again (at most three times). `nt_fixture` lists every object it made in the container
+  over SMB after clearing their flags and fails at once, naming the path and how to recreate the
+  DC, when a file lists with `D`, a directory without it, or anything with `R`, `H` or `S`. A
+  test there never replaces a file it made read-only. The local
+  files the `access` tests put are `notes.txt` (6 bytes) and `big.bin` (300,000) in the test's
+  `tmp` directory, reached with `lcd`.
 
 Nothing waits without a limit; a timeout kills the child and panics with what was read.
 
@@ -656,3 +682,55 @@ harness keeps every test away from it; `ccache_paths` and `ticket_choice` hold t
 hint); a KDC found by the realm's name without a proxy (the host cannot resolve `rsmb.test`; S72
 asserts the failure and its message); a realm with more than one KDC, a `krb5.conf` with
 `include`; a clock difference between client and KDC (the containers share the host's clock).
+
+## Stage 6: `access`
+
+Unit tests:
+
+| Test | File | Protects |
+|---|---|---|
+| `rights_from_masks` | commands | `allowed` on every measured pair of `docs/plans/stage-6.md` 2.4 to 2.6 and 2.13, the masks written as hex literals: `upload` under the root `ls put mkdir ?`; the root `ls - - -`; `traverse-only`, `forbidden` `- - - -`; `secret.txt` `- put rm`; `dosro.txt` `get - -` (K1); `sticky/rootfile.txt` `get - -` (not "or DELETE_CHILD"); `rodir2/minedir` and NT `I/sub` `ls put mkdir ?` (the user's rule); `sticky/rwxsub` `rmdir` (K3); `writeonly` `- put mkdir rmdir`; NT `A`, `C`, `D/file.txt`, `F/file.txt` (K2), `H/nosync.txt` (K4), `J` (K7); `rodos` `ls ? ? -`, `rodos/f.txt` `get ? rm`, `rodos/sub` `rmdir`; a file without DELETE under a read-only parent `put -`; no mask: every column None; a parent unknown: a file's `put` None with DELETE, false without; a directory's `rmdir` None; the root `rmdir` false |
+| `access_lines` | commands | `access_line` byte for byte for every line of the plan's 5.5 text, `?` in one column and in all with `(access denied)`, `(not found)`, `(other)`; the name at column 24 |
+| `maximal_access_answers` | session | `maximal_access` on chains built with `pack_contexts`: MxAc with `QueryStatus` 0 → the mask; `QueryStatus` 0xC0000022, 4 bytes of data, only a `QFid`, an empty chain, a `Next` past the end → None; MxAc after a `QFid` → the mask |
+| `rights_request_shape` | session | `rights_request`: desired access 0x80, `FileOpen`, options 0, share access 7, no oplock, the name; one context `MxAc` without data; packed by the crate, the body's context offset and length are not 0 |
+| `chain_answers_up_to_the_first_failure` | session | `answered`: up to and including the first failed CREATE, which counts itself only when it is the first or the CLOSE before it succeeded (`[(t,f),(f,f)]` → 1) |
+| `chain_retries_keep_their_places` | session | `settle`: the answered results go to their own indices, nothing else is touched, every later index of the chain is queued alone, in order, behind what was queued; a single path that failed queues nothing |
+| `table_is_complete`, `help_all_has_everything` (extended) | commands | the new command and the `access` object in the manual |
+
+`tests/fast.rs` (both runs: `fast()` direct and through the proxy, `dc()` by address and by name):
+
+| Test | Row | Protects |
+|---|---|---|
+| `access_predicts_posix` | F81 | the POSIX fixture (`posix_fixture`), one session: `access <S>`, `access -e` of `<S>`, `rodir`, `rodir2`, `sticky`, `listonly`, `rodos`, `mixed`; **every mask equals the plan's 2.4 and 2.13** (38 paths; `rodos` with attributes 0x11); then 52 command lines of 2.7 and 2.13 in order, each compared with its column: agree, or **K1** (`dosro.txt`) and **K3** (`sticky/rwxsub`) disagree exactly so, or **unknown** (`rodir2/minedir`, `rodos` `put` and `mkdir`, `rodos/f.txt`) with the measured outcome; `put -f big.bin big.bin` agrees (A14); in `mixed` the FIFO is `null` with `error` `other` and `a.txt`, `c.txt`, `d` have their masks under their own names (the retries land in their places); `listonly` lists nothing, `access <S>/listonly/a.txt` and `get listonly/a.txt` are `access_denied` |
+| `access_predicts_nt_acls` | F82 | the NT ACL fixture (`nt_fixture`) on the DC, Kerberos: `nt_fixture` first fails when any of its 22 objects lists as other than it is (a stale record, `docs/test-environment.md`); then the scratch directory's mask 0x001f01ff and attributes 0x10 (no stale DOS record); `access -e` of `<S>`, `D`, `E`, `F`, `H`, `I`; every mask equals 2.6 (22 paths); 22 command lines, agree except **K2** (`F/file.txt`), **K4** (`H/nosync.txt` get, `H/nosyncdir` ls) and **K7** (`J`: `put` refused, its part file left in `J`), unknown `I/sub` (`rmdir` works); the group ACE of `G` agrees |
+| `access_by_share_and_login` | F83 | on `readonly` every `put`, `mkdir`, `replace`, `rm`, `rmdir` false (the directories with the DOS read-only attribute `null`), `ls` and `get` as on `share`, the masks of 2.5, and `put`, `rm`, `mkdir` through it `access_denied`; on `encrypted` the same masks as on `share`; on `guest` as anonymous and as `Guest` `access /` is `d  ls  -   -     -      /`, `access hello.txt` `-  get -         -      /hello.txt`, `put` fails; as tester on `share` `access /` the same line |
+| `access_costs` | F84 | tapped: `access` at the root 2 / 1, `access upload` 4 / 1, `access nosuch` 4 / 1 `not_found`, `access nosuch/x` 6 / 2, `-e listonly` 7 / 2 with no object, `access listonly/a.txt` 4 / 1 `access_denied`, `-e mixed` 19 / 3 (5 + 10 + 4), `-e /tree` 19 / 2 twice (no cache), `-e /` 43 in 2 or 3 flights, `-e` of a file `not_a_directory` 5 / 1, then `ls /tree` 5 / 1 and `cd /tree/d0` 2 / 1 as before the stage |
+| `access_output` | F85 | the text lines byte for byte (a file, a directory, `-e mixed` with `(other)`, `access` after `cd /tree`); JSON keys: a directory exactly `ls put mkdir rmdir`, a file exactly `get replace rm`, integers for `mask` and `attributes`, `error` null, the listing's order; `access` before `use` and `access -e a b`: `usage`; `access -- -e`: `not_found` for `/-e` |
+| `access_refreshes_the_cache` | F86 | on a pty, after `access -e /tree` Tab on `cd /tree/d` costs 0 requests and lists `d0/` to `d3/` |
+| `put_over_a_file_without_synchronize` | F87 | A14: `put -f` of 300,000 bytes over root's 0600 file works (sha256 equal; CREATE 3, CLOSE 3 as `transfer_costs`); `put` without `-f` over root's 0600 file `already_exists` with `-f replaces it`; `put` of a small and a large file onto root's 0700 directory `is_a_directory` with `write '…rootdir700/'`; no temporary file left. **Failed before the change** (the first line was `access_denied`) |
+| `help_all_needs_no_server`, `docs_match_the_table` (extended) | H | 20 commands in the manual; the section ``## `access` `` of `commands.md` with its syntax and three examples |
+
+`tests/slow.rs`:
+
+| Test | Row | Protects |
+|---|---|---|
+| `access_slow` | S81 | at the slow endpoint `access upload` 4 / 1, `-e /tree` 19 / 2, `-e /fanout` 2,000 objects with a mask, 4,007 requests, within `NO_HANG` |
+| `access_edge` | S82 | on edge (16 credits) `-e /fanout`: 2,000 masks, the listing (as `ls /fanout` in the same session) + 4,002 requests, within 30 s, `credit_balance` never below 0 |
+| `cut_mid_access` | S83 | `access -e /many` at slow, the tap's connections dropped after 40 CREATEs: ok, 10,000 objects, each path once, exactly 1 new connection, requests and the listing's QUERY_DIRECTORY on both connections (it ran again from its start) |
+| `interrupt_mid_access` | S84 | the same, then `kill -INT` (and, a new client, `kill -TERM`): exit 130, `interrupted`, within `NO_HANG` |
+| `put_f_refused_by_the_rename` | S85 | A14's failure-matrix row: `put -f` of 300,000 bytes over root's 0600 file in root's sticky directory: `access_denied`, `refused to replace it`, the WRITEs went out, no `.rsmb-` file left, the target's sha256 unchanged |
+
+`tests/serial.rs`:
+
+| Test | Row | Protects |
+|---|---|---|
+| `timing_access` | X81 | at slow, netem drops checked: `access upload` 5 × 4 / 1 in the tap; medians `access upload` < 260 ms (201.6), `-e /tree` < 500 ms (404.5), `-e /fanout` < 4 s (1,921, with its listing) |
+
+Not in the gate (Stage 6), and why: a Windows server (none in the environment); `-e /huge`
+(about 22 s at the fast endpoint; the shape is the same as `many/`); times through the proxy at
+the slow endpoint (microsocks' Nagle, measured while planning; the counts run in the proxied
+pass); a silent server during `access` (the existing rule, tested for other commands); edge at
+100 ms each way (computed); a second client holding an oplock while `access` opens the file; the
+50 MiB `put -f` of the plan's 2.13 (S85 has the outcome with 300,000 bytes); an error of
+`execute_compound` that is not a lost connection and a probe task that panics (neither can be made
+to happen against a real server; a few lines the review reads).

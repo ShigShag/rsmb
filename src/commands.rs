@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 
 use crate::Flow;
-use crate::session::{Entry, Error, KIND_NAMES, Kind, Result, Session, display_path, safe};
+use crate::session::{Entry, Error, KIND_NAMES, Kind, Result, Rights, Session, display_path, safe};
 use crate::shell::tokenize;
 use crate::transfer;
 use crate::walk;
@@ -23,6 +23,7 @@ pub enum CmdId {
     Cd,
     Pwd,
     Ls,
+    Access,
     Tree,
     Find,
     Get,
@@ -167,6 +168,58 @@ pub static COMMANDS: &[Cmd] = &[
             (
                 "ls \"special/dir with space\"",
                 "list a directory whose name has spaces",
+            ),
+        ],
+        rerun: true,
+    },
+    Cmd {
+        id: CmdId::Access,
+        name: "access",
+        syntax: "access [-e] [<path>]",
+        summary: "show which commands the server would allow on a path, without trying them",
+        details: "Asks the server for your access to the path (default: the working directory) and \
+                  shows what it allows, as rsmb commands: for a directory ls (list it), put (a new \
+                  file into it), mkdir (a directory in it), rmdir (remove it); for a file get (and \
+                  cat), put (put -f over it; 'replace' in --json), rm. '-' is refused, '?' unknown: \
+                  rmdir is '?' when the directory may be deleted but the one above it lets you \
+                  change nothing (Samba on Unix permissions refuses, on NT ACLs allows), put and \
+                  mkdir are '?' in a directory with the DOS read-only attribute, and so is put \
+                  over a file in it (Samba hides the rights but does not enforce it on \
+                  directories). Nothing is created, changed or \
+                  tried: one open per path for its attributes, with the server's maximal-access \
+                  answer (MxAc). With -e, every entry of the directory instead, listed like ls \
+                  (always asked, refreshes the cache Tab uses). Costs on Samba: 4 requests in 1 \
+                  round trip (the path and its directory in one compound), 2 at the share root; \
+                  -e: the listing (5 requests, 1 round trip), then 2 per entry plus 2, 16 per \
+                  compound, 256 at once (1 more round trip up to 255 entries); nothing is printed \
+                  before the last answer (a directory of 100,000 entries takes about 22 s on a \
+                  fast link). It is the server's answer for this login: on Samba it includes the \
+                  share's read only. It does not tell whether a directory is empty, a file is in \
+                  use, the disk is full, or a name exists, and it can say put where put fails: in \
+                  a drop box whose inherited permissions do not let you delete your own new file, \
+                  put writes it and cannot rename it. docs/known-limitations.md lists every case \
+                  where the server's answer and the command differ. One line per path: 'd' or \
+                  '-', the four columns, the name. With --json one 'access' object each, with the \
+                  mask. Errors: not_found, access_denied (not even the attributes can be read), \
+                  not_a_directory (-e on a file), invalid_name, usage; with -e an entry that \
+                  cannot be asked about is a '?' line (an object with error) and the command \
+                  succeeds. Run again once after a lost connection (it prints nothing before its \
+                  last answer).",
+        flags: &[(
+            "-e",
+            "every entry of the directory instead of the directory itself",
+        )],
+        args: &[Arg::RemotePath],
+        required: 0,
+        examples: &[
+            ("access", "what you may do with the working directory"),
+            (
+                "access upload",
+                "may you list upload, put a file into it, make a directory in it, remove it?",
+            ),
+            (
+                "access -e /tree",
+                "the same for every entry of /tree, files and directories",
             ),
         ],
         rerun: true,
@@ -947,6 +1000,7 @@ async fn dispatch(cmd: &Cmd, sess: &mut Session, out: &mut Out, a: &Args) -> Res
         CmdId::Cd => sess.cd(arg.unwrap_or("/")).await?,
         CmdId::Pwd => pwd(sess, out),
         CmdId::Ls => ls(sess, out, arg).await?,
+        CmdId::Access => access_cmd(sess, out, a).await?,
         CmdId::Tree => tree_cmd(sess, out, a).await?,
         CmdId::Find => find_cmd(sess, out, a).await?,
         CmdId::Get => transfer::get(sess, out, flags, args).await?,
@@ -1240,6 +1294,219 @@ pub fn filetime(ft: u64, rfc3339: bool) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// access
+
+/// What `access` shows for one path: Some(true) allowed, Some(false) refused, None unknown.
+/// For a file `mkdir` is None and is not shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Allowed {
+    /// `ls` on a directory, `get` on a file.
+    pub read: Option<bool>,
+    /// `put` into a directory, `put -f` over a file (`replace` in JSON).
+    pub put: Option<bool>,
+    pub mkdir: Option<bool>,
+    /// `rmdir` on a directory, `rm` on a file.
+    pub remove: Option<bool>,
+}
+
+/// FILE_LIST_DIRECTORY on a directory, FILE_READ_DATA on a file.
+const LIST_OR_READ: u32 = 0x1;
+/// FILE_ADD_FILE on a directory.
+const ADD_FILE: u32 = 0x2;
+/// FILE_ADD_SUBDIRECTORY.
+const ADD_SUBDIR: u32 = 0x4;
+/// FILE_DELETE_CHILD.
+const DELETE_CHILD: u32 = 0x40;
+const DELETE: u32 = 0x1_0000;
+/// FILE_ATTRIBUTE_READONLY in the CREATE answer.
+const READ_ONLY: u32 = 0x1;
+
+/// The rule of docs/commands.md, `access` (Stage 6 plan A7): from the server's mask to rsmb's
+/// commands, by what each command really sends. `parent`: the rights of the directory the path
+/// is in, None when they are unknown (its probe failed) or at the share root; `root`: the path is
+/// the share root. A refusal that one mask decides is not made unknown by the other.
+pub fn allowed(r: Rights, parent: Option<Rights>, root: bool) -> Allowed {
+    let Some(m) = r.mask else {
+        return Allowed {
+            read: None,
+            put: None,
+            mkdir: None,
+            remove: None,
+        };
+    };
+    let has = |m: u32, bit: u32| m & bit != 0;
+    let read_only = |x: Rights| x.attributes & READ_ONLY != 0;
+    let p = parent.and_then(|p| p.mask);
+    if r.is_dir {
+        // Samba drops WD and AD for a directory's DOS read-only attribute but does not enforce it.
+        let add = |bit| match () {
+            _ if has(m, bit) => Some(true),
+            _ if read_only(r) => None,
+            _ => Some(false),
+        };
+        // DELETE on a directory is not enough: on Unix permissions the parent decides, on NT
+        // ACLs it does not, and no mask tells the two apart when the parent lets nothing change.
+        let remove = if root || !has(m, DELETE) {
+            Some(false)
+        } else {
+            p.and_then(|p| has(p, ADD_FILE | ADD_SUBDIR | DELETE_CHILD).then_some(true))
+        };
+        Allowed {
+            read: Some(has(m, LIST_OR_READ)),
+            put: add(ADD_FILE),
+            mkdir: add(ADD_SUBDIR),
+            remove,
+        }
+    } else {
+        // put -f: a temporary file in the parent, renamed over this one (which needs DELETE).
+        let put = match p {
+            _ if !has(m, DELETE) => Some(false),
+            None => None,
+            Some(p) if has(p, ADD_FILE) => Some(true),
+            Some(_) if parent.is_some_and(read_only) => None,
+            Some(_) => Some(false),
+        };
+        Allowed {
+            read: Some(has(m, LIST_OR_READ)),
+            put,
+            mkdir: None,
+            remove: Some(has(m, DELETE)),
+        }
+    }
+}
+
+/// `d  ls  put mkdir rmdir  name`: the mark, four columns of 3, 3, 5 and 5 characters, the name;
+/// with `error`, `?` in every column and `  (<kind with spaces>)` after the name.
+pub fn access_line(name: &str, is_dir: bool, a: Allowed, error: Option<Kind>) -> String {
+    let col = |v: Option<bool>, word: &'static str| match v {
+        _ if error.is_some() => "?",
+        Some(true) => word,
+        Some(false) => "-",
+        None => "?",
+    };
+    let (mark, c1, c2, c3, c4) = if is_dir {
+        let c = (
+            col(a.read, "ls"),
+            col(a.put, "put"),
+            col(a.mkdir, "mkdir"),
+            col(a.remove, "rmdir"),
+        );
+        ('d', c.0, c.1, c.2, c.3)
+    } else {
+        let c = (col(a.read, "get"), col(a.put, "put"), col(a.remove, "rm"));
+        ('-', c.0, c.1, "", c.2)
+    };
+    let tail = error.map_or(String::new(), |k| {
+        format!("  ({})", k.name().replace('_', " "))
+    });
+    format!("{mark}  {c1:<3} {c2:<3} {c3:<5} {c4:<5}  {name}{tail}")
+}
+
+/// The `access` object: a directory carries ls, put, mkdir, rmdir; a file get, replace, rm.
+fn access_obj(path: &[String], is_dir: bool, r: &Result<Rights>, a: Allowed) -> Value {
+    let (mask, attributes, error) = match r {
+        Ok(x) => (json!(x.mask), json!(x.attributes), Value::Null),
+        Err(e) => (Value::Null, Value::Null, json!(e.kind.name())),
+    };
+    let mut v = json!({"type": "access", "name": path.last().map_or("", String::as_str),
+                       "path": display_path(path), "is_dir": is_dir, "mask": mask,
+                       "attributes": attributes, "error": error});
+    if is_dir {
+        v["ls"] = json!(a.read);
+        v["put"] = json!(a.put);
+        v["mkdir"] = json!(a.mkdir);
+        v["rmdir"] = json!(a.remove);
+    } else {
+        v["get"] = json!(a.read);
+        v["replace"] = json!(a.put);
+        v["rm"] = json!(a.remove);
+    }
+    v
+}
+
+/// One line or object per path. An entry of `-e` whose probe failed is shown with its error.
+fn access_print(
+    out: &mut Out,
+    path: &[String],
+    name: &str,
+    is_dir: bool,
+    r: &Result<Rights>,
+    a: Allowed,
+) {
+    if out.json {
+        out.obj(&access_obj(path, is_dir, r, a));
+    } else {
+        let slash = if is_dir && !name.ends_with('/') {
+            "/"
+        } else {
+            ""
+        };
+        let error = r.as_ref().err().map(|e| e.kind);
+        out.text(&access_line(&format!("{name}{slash}"), is_dir, a, error));
+    }
+}
+
+/// `access [-e] [<path>]`: the server's answer for the path (with its directory, in one
+/// compound), or with `-e` for every entry of the directory (listed like `ls`). Everything is
+/// printed after the last answer, so a run again after a lost connection prints nothing twice.
+async fn access_cmd(sess: &mut Session, out: &mut Out, a: &Args) -> Result<()> {
+    if sess.share().is_none() {
+        return Err(Error::usage("no share selected: use <share> first"));
+    }
+    let path = sess.resolve(a.pos.first().map_or(".", String::as_str));
+    if !has(&a.flags, "-e") {
+        let mut paths = vec![path.clone()];
+        if !path.is_empty() {
+            paths.insert(0, path[..path.len() - 1].to_vec());
+        }
+        let mut r = sess.rights(&paths).await?;
+        let own = r.pop().ok_or_else(|| Error::other("access: no answer"))??;
+        let parent = r.pop().and_then(|p| p.ok());
+        let shown = if path.is_empty() {
+            "/".to_string()
+        } else {
+            display_path(&path)
+        };
+        access_print(
+            out,
+            &path,
+            &shown,
+            own.is_dir,
+            &Ok(own),
+            allowed(own, parent, path.is_empty()),
+        );
+        return Ok(());
+    }
+    let entries = sess.list(&path).await?;
+    let mut paths = Vec::with_capacity(entries.len() + 1);
+    paths.push(path.clone());
+    for e in entries.iter() {
+        let mut p = path.clone();
+        p.push(e.name.clone());
+        paths.push(p);
+    }
+    let r = sess.rights(&paths).await?;
+    let parent = r[0].as_ref().ok().copied();
+    for ((e, p), x) in entries.iter().zip(&paths[1..]).zip(&r[1..]) {
+        let is_dir = e.is_dir();
+        let a = match x {
+            Ok(x) => allowed(Rights { is_dir, ..*x }, parent, false),
+            Err(_) => allowed(
+                Rights {
+                    is_dir,
+                    attributes: 0,
+                    mask: None,
+                },
+                None,
+                false,
+            ),
+        };
+        access_print(out, p, &e.name, is_dir, x, a);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // tree and find
 
 /// What `each` gets for every listed directory: the sink, the progress line (clear it before
@@ -1512,6 +1779,16 @@ pub const JSON_OBJECTS: &[(&str, &str)] = &[
          only after a walk that ran to its end",
     ),
     (
+        "access",
+        "name string, path string (from the share root, starting with /), is_dir bool, mask \
+         integer (the MaximalAccess the server computed for this session) or null, attributes \
+         integer (the file attributes of the server's answer: 16 directory, 1 read-only) or null, \
+         error string (an error kind: this entry could not be asked about; access -e only, the \
+         same path alone is the command's error) or null; a directory has ls, put (a new file \
+         into it), mkdir, rmdir; a file get, replace (put -f over it), rm: each true (allowed), \
+         false (refused) or null (unknown)",
+    ),
+    (
         "pwd",
         "host string, share string or null, path string (/ or /a/b)",
     ),
@@ -1621,7 +1898,7 @@ bidi control (U+202A-202E, U+2066-2069, U+200E, U+200F, U+061C) in a name or mes
 server is shown escaped as \\u{9b}; --json and the names sent back to the server and used for local \
 files keep the exact name. Tab completes command names, share names after \
 use, and remote paths (directories only after cd, mkdir, rmdir, tree and find; directories and \
-files after ls, get, cat, rm and as put's second argument). As get's second argument, put's first \
+files after ls, access, get, cat, rm and as put's second argument). As get's second argument, put's first \
 and after lcd (directories only) and lls it completes local paths, with no request. Names that \
 hold control or bidi characters are shown escaped as \\u{9b} in the candidate list."
         .to_string()
@@ -2238,6 +2515,7 @@ pub mod tests {
             "denied",
             "skipped",
             "walk_summary",
+            "access",
         ] {
             assert!(JSON_OBJECTS.iter().any(|(n, _)| *n == t), "{t}");
             assert!(raw.contains(&format!("\n    {t} ")), "json type {t}");
@@ -2410,5 +2688,284 @@ pub mod tests {
             out.diag("to stderr");
             assert!(!out.written(), "json {json}: diag goes to stderr");
         }
+    }
+
+    /// A directory (`d`) or a file (`f`) with a mask and the attributes Samba sends with it.
+    fn d(mask: u32) -> Rights {
+        Rights {
+            is_dir: true,
+            attributes: 0x10,
+            mask: Some(mask),
+        }
+    }
+    fn f(mask: u32) -> Rights {
+        Rights {
+            is_dir: false,
+            attributes: 0x20,
+            mask: Some(mask),
+        }
+    }
+    /// The four columns as `access` prints them: the word, `-` or `?`.
+    fn cols(r: Rights, parent: Option<Rights>, root: bool) -> String {
+        let line = access_line("x", r.is_dir, allowed(r, parent, root), None);
+        line[3..line.len() - 3]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The measured pairs of docs/plans/stage-6.md 2.4 to 2.6 and 2.13 (the masks as measured).
+    #[test]
+    fn rights_from_masks() {
+        let s = d(0x001f_01ff); // the scratch directory S, tester's 0755
+        let root = d(0x0012_00a9);
+        let cases: &[(&str, Rights, Option<Rights>, bool, &str)] = &[
+            (
+                "S under upload",
+                s,
+                Some(d(0x001f_01ff)),
+                false,
+                "ls put mkdir rmdir",
+            ),
+            (
+                "upload under the root",
+                d(0x001f_01ff),
+                Some(root),
+                false,
+                "ls put mkdir ?",
+            ),
+            ("the share root", root, None, true, "ls - - -"),
+            (
+                "traverse-only",
+                d(0x0012_00a0),
+                Some(root),
+                false,
+                "- - - -",
+            ),
+            ("forbidden", d(0x0000_0080), Some(root), false, "- - - -"),
+            (
+                "known.txt",
+                f(0x0012_0089),
+                Some(d(0x0012_00a0)),
+                false,
+                "get - -",
+            ),
+            ("mine.txt", f(0x0017_019f), Some(s), false, "get put rm"),
+            ("rootfile.txt", f(0x0013_0089), Some(s), false, "get put rm"),
+            ("secret.txt", f(0x0001_0080), Some(s), false, "- put rm"),
+            ("dosro.txt (K1)", f(0x0004_0089), Some(s), false, "get - -"),
+            (
+                "rodir/ww.txt",
+                f(0x0012_019f),
+                Some(d(0x0013_00a9)),
+                false,
+                "get - -",
+            ),
+            (
+                "sticky/rootfile.txt: not 'or DC'",
+                f(0x0012_0089),
+                Some(d(0x001f_01ff)),
+                false,
+                "get - -",
+            ),
+            (
+                "rodir2/minedir: the user's rule",
+                d(0x001f_01ff),
+                Some(d(0x0013_00a9)),
+                false,
+                "ls put mkdir ?",
+            ),
+            (
+                "sticky/rwxsub (K3)",
+                d(0x001f_01ff),
+                Some(d(0x001f_01ff)),
+                false,
+                "ls put mkdir rmdir",
+            ),
+            ("emptyroot", d(0x0013_00a9), Some(s), false, "ls - - rmdir"),
+            (
+                "writeonly",
+                d(0x0013_01f6),
+                Some(s),
+                false,
+                "- put mkdir rmdir",
+            ),
+            (
+                "readonly: mine.txt",
+                f(0x0004_0089),
+                Some(d(0x000c_00a9)),
+                false,
+                "get - -",
+            ),
+            ("NT A", d(0x0012_00ab), Some(s), false, "ls put - -"),
+            ("NT C", d(0x0012_00ad), Some(s), false, "ls - mkdir -"),
+            (
+                "NT D/file.txt",
+                f(0x0013_0089),
+                Some(d(0x0012_00e9)),
+                false,
+                "get - rm",
+            ),
+            (
+                "NT F/file.txt (K2)",
+                f(0x0012_0089),
+                Some(d(0x0012_00ab)),
+                false,
+                "get - -",
+            ),
+            (
+                "NT H/nosync.txt (K4)",
+                f(0x0000_0081),
+                Some(d(0x0012_00a9)),
+                false,
+                "get - -",
+            ),
+            (
+                "NT I/sub",
+                d(0x001f_01ff),
+                Some(d(0x0012_00a9)),
+                false,
+                "ls put mkdir ?",
+            ),
+            (
+                "NT I/own.txt",
+                f(0x001f_01ff),
+                Some(d(0x0012_00a9)),
+                false,
+                "get - rm",
+            ),
+            ("NT J (K7)", d(0x0012_00ab), Some(s), false, "ls put - -"),
+        ];
+        for (what, r, p, at_root, want) in cases {
+            assert_eq!(cols(*r, *p, *at_root), *want, "{what}");
+        }
+        // a directory with the DOS read-only attribute (2.13)
+        let rodos = Rights {
+            is_dir: true,
+            attributes: 0x11,
+            mask: Some(0x000c_00e9),
+        };
+        assert_eq!(cols(rodos, Some(s), false), "ls ? ? -", "rodos (no DE)");
+        assert_eq!(
+            cols(f(0x0017_019f), Some(rodos), false),
+            "get ? rm",
+            "rodos/f.txt"
+        );
+        assert_eq!(
+            cols(d(0x001f_01ff), Some(rodos), false),
+            "ls put mkdir rmdir",
+            "rodos/sub: rodos keeps DC"
+        );
+        assert_eq!(
+            cols(f(0x0012_0089), Some(rodos), false),
+            "get - -",
+            "a file without DE under a read-only parent: put -, not ?"
+        );
+        // unknown masks
+        let none = Rights {
+            is_dir: false,
+            attributes: 0,
+            mask: None,
+        };
+        let all_none = Allowed {
+            read: None,
+            put: None,
+            mkdir: None,
+            remove: None,
+        };
+        assert_eq!(allowed(none, Some(s), false), all_none);
+        let a = allowed(f(0x0017_019f), None, false);
+        assert_eq!(
+            (a.put, a.remove),
+            (None, Some(true)),
+            "file with DE, parent unknown"
+        );
+        let a = allowed(f(0x0012_0089), None, false);
+        assert_eq!(
+            a.put,
+            Some(false),
+            "file without DE, parent unknown: false, not None"
+        );
+        let a = allowed(d(0x001f_01ff), None, false);
+        assert_eq!(a.remove, None, "directory with DE, parent unknown");
+        let a = allowed(d(0x001f_01ff), None, true);
+        assert_eq!(a.remove, Some(false), "the root with DE");
+        assert_eq!(a.mkdir, Some(true));
+        assert_eq!(
+            allowed(f(0x001f_01ff), Some(s), false).mkdir,
+            None,
+            "no mkdir on a file"
+        );
+    }
+
+    #[test]
+    fn access_lines() {
+        let a = |read, put, mkdir, remove| Allowed {
+            read,
+            put,
+            mkdir,
+            remove,
+        };
+        let (t, n, u) = (Some(true), Some(false), None);
+        let lines = [
+            (
+                access_line("/upload/rsmb-test-1/", true, a(t, t, t, t), None),
+                "d  ls  put mkdir rmdir  /upload/rsmb-test-1/",
+            ),
+            (
+                access_line("/upload/", true, a(t, t, t, u), None),
+                "d  ls  put mkdir ?      /upload/",
+            ),
+            (
+                access_line("/", true, a(t, n, n, n), None),
+                "d  ls  -   -     -      /",
+            ),
+            (
+                access_line("mine.txt", false, a(t, t, u, t), None),
+                "-  get put       rm     mine.txt",
+            ),
+            (
+                access_line("secret.txt", false, a(n, t, u, t), None),
+                "-  -   put       rm     secret.txt",
+            ),
+            (
+                access_line("dosro.txt", false, a(t, n, u, n), None),
+                "-  get -         -      dosro.txt",
+            ),
+            (
+                access_line("rodir/", true, a(t, n, n, t), None),
+                "d  ls  -   -     rmdir  rodir/",
+            ),
+            (
+                access_line("writeonly/", true, a(n, t, t, t), None),
+                "d  -   put mkdir rmdir  writeonly/",
+            ),
+            (
+                access_line("minedir/", true, a(t, t, t, u), None),
+                "d  ls  put mkdir ?      minedir/",
+            ),
+            (
+                access_line("rodos/", true, a(t, u, u, n), None),
+                "d  ls  ?   ?     -      rodos/",
+            ),
+            (
+                access_line("a.txt", false, a(u, u, u, u), Some(Kind::AccessDenied)),
+                "-  ?   ?         ?      a.txt  (access denied)",
+            ),
+            (
+                access_line("b", true, a(t, t, t, t), Some(Kind::NotFound)),
+                "d  ?   ?   ?     ?      b  (not found)",
+            ),
+            (
+                access_line("b.fifo", false, a(u, u, u, u), Some(Kind::Other)),
+                "-  ?   ?         ?      b.fifo  (other)",
+            ),
+        ];
+        for (got, want) in lines {
+            assert_eq!(got, want);
+        }
+        // the columns: 1 + 2, 3 + 1, 3 + 1, 5 + 1, 5 + 2, then the name
+        let l = access_line("n", true, a(n, n, n, n), None);
+        assert_eq!(l.find('n'), Some(24), "{l:?}");
     }
 }
